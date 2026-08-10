@@ -1,0 +1,5 @@
+requests~=2.34.2
+beautifulsoup4~=4.15.0
+fake-useragent~=2.2.0
+readability-lxml~=0.8.4.1
+PySide6~=6.11.1
