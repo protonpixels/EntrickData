@@ -7,6 +7,7 @@ import webbrowser
 import time
 import random
 from collections import Counter
+from typing import List, Dict
 from urllib.parse import urljoin
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl
@@ -1198,15 +1199,18 @@ class DataResearchView(QWidget):
         all_elements = self.db.get_elements_for_page(self.data_path, page['id'])
         self.elements = [e for e in all_elements if e.get('type') != 'section']
 
-        # Extract links and media
+        # Extract links and media - use raw HTML for better extraction
         raw_html = page.get('raw_html', '')
         main_html = page.get('main_html', '')
 
         self.links = self.extract_links(raw_html)
         self.media_items = self.extract_media(raw_html)
 
-        # Display formatted text
-        self.display_formatted_text(main_html)
+        # Display formatted text using RAW HTML for better content
+        if raw_html:
+            self.display_formatted_text(raw_html)
+        else:
+            self.display_formatted_text(main_html)
 
         # Display links
         self.display_links()
@@ -1498,28 +1502,278 @@ class DataResearchView(QWidget):
         if self.current_page_index < 0 or self.current_page_index >= len(self.pages):
             return
 
-        # For "Text Organized", display formatted HTML instead of plain text
-        if display_type == "Text Organized":
-            page = self.pages[self.current_page_index]
-            html_content = page.get('main_html', '')
-            if html_content:
-                self._display_html_content(html_content)
+        page = self.pages[self.current_page_index]
+
+        # Use raw HTML for all display modes
+        raw_html = page.get('raw_html', '')
+        if not raw_html:
+            raw_html = page.get('main_html', '')
+
+        if not raw_html:
+            self.text_content_view.clear()
             return
 
-        text_map = {
-            "Text Jumble": self.get_text_jumble,
-            "Text Elements": self.get_text_elements,
-            "Text Headers": self.get_text_headers,
-            "Text Paragraphs": self.get_text_paragraphs,
-            "Text Sentences": self.get_text_sentences,
-            "Text Unique Words": self.get_text_unique_words,
-            "Text Repeated Words": self.get_text_repeated_words,
-            "Text Questions": self.get_text_questions
-        }
+        # For "Text Organized", display as formatted HTML
+        if display_type == "Text Organized":
+            self._display_html_content(raw_html)
+            return
 
-        if display_type in text_map:
-            text = text_map[display_type]()
+        # For other display types, extract and transform the text
+        self._display_transformed_content(raw_html, display_type)
+
+    def _display_transformed_content(self, html_content, display_type):
+        """Display transformed content based on display type - excluding media elements"""
+        if not html_content:
+            self.text_content_view.clear()
+            return
+
+        # Parse the HTML and clean it
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+        except Exception as e:
+            print(f"Error parsing HTML: {e}")
+            self.text_content_view.setPlainText("Error parsing HTML content.")
+            return
+
+        # Remove unwanted elements
+        for tag in soup.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside', 'noscript']):
+            tag.decompose()
+
+        # Remove media elements (images, videos, audio, iframes)
+        for tag in soup.find_all(['img', 'video', 'audio', 'iframe', 'picture', 'source', 'svg']):
+            tag.decompose()
+
+        # Remove elements with media-related classes or attributes
+        for elem in soup.find_all():
+            # Skip if elem is None or not a Tag
+            if elem is None or not hasattr(elem, 'name'):
+                continue
+
+            # Check for media-related classes (safely)
+            if hasattr(elem, 'get') and callable(elem.get):
+                try:
+                    class_list = elem.get('class')
+                    if class_list:
+                        if isinstance(class_list, list):
+                            classes = ' '.join(class_list).lower()
+                        else:
+                            classes = str(class_list).lower()
+
+                        if any(media in classes for media in
+                               ['media', 'image', 'video', 'audio', 'player', 'gallery', 'slider']):
+                            elem.decompose()
+                            continue
+                except (TypeError, AttributeError):
+                    pass
+
+            # Check for media-related roles (safely)
+            if hasattr(elem, 'get') and callable(elem.get):
+                try:
+                    role = elem.get('role')
+                    if role and 'img' in str(role).lower():
+                        elem.decompose()
+                        continue
+                except (TypeError, AttributeError):
+                    pass
+
+            # Check for src attributes that are images (safely)
+            if hasattr(elem, 'get') and callable(elem.get):
+                try:
+                    src = elem.get('src')
+                    if src and any(
+                            ext in str(src).lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg']):
+                        elem.decompose()
+                        continue
+                except (TypeError, AttributeError):
+                    pass
+
+        # Extract all text
+        all_text = soup.get_text(separator=' ', strip=True)
+
+        if display_type == "Text Jumble":
+            # All text without new lines - just clean up spacing
+            text = ' '.join(all_text.split())
             self.text_content_view.setPlainText(text)
+
+        elif display_type == "Text Elements":
+            # Show all text content with element context (excluding media)
+            elements = []
+            for elem in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote']):
+                # Skip if element contains media
+                if elem.find(['img', 'video', 'audio', 'iframe', 'picture']):
+                    continue
+                text = elem.get_text(strip=True)
+                if text and len(text) > 2:
+                    elem_type = elem.name
+                    if elem_type.startswith('h'):
+                        elem_type = 'heading'
+                    elif elem_type == 'li':
+                        elem_type = 'list_item'
+                    elif elem_type == 'blockquote':
+                        elem_type = 'quote'
+                    else:
+                        elem_type = 'paragraph'
+                    elements.append(f"[{elem_type.upper()}] {text}")
+
+            # Also get div/section content that might contain text
+            for elem in soup.find_all(['div', 'section', 'article']):
+                # Skip if contains media
+                if elem.find(['img', 'video', 'audio', 'iframe', 'picture']):
+                    continue
+                text = elem.get_text(strip=True)
+                if text and len(text) > 30:
+                    # Check if this div contains any of the already extracted elements
+                    has_child = False
+                    for child in elem.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote']):
+                        if child.get_text(strip=True):
+                            has_child = True
+                            break
+                    if not has_child:
+                        elements.append(f"[SECTION] {text}")
+
+            result = "\n\n".join(elements)
+            self.text_content_view.setPlainText(result)
+
+        elif display_type == "Text Headers":
+            # Only headers (excluding media-containing ones)
+            headers = soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+            texts = []
+            for h in headers:
+                # Skip if header contains media
+                if h.find(['img', 'video', 'audio', 'iframe', 'picture']):
+                    continue
+                text = h.get_text(strip=True)
+                if text:
+                    texts.append(text)
+            text = "\n\n".join(texts)
+            self.text_content_view.setPlainText(text)
+
+        elif display_type == "Text Paragraphs":
+            # All paragraphs (excluding media-containing ones)
+            paragraphs = soup.find_all('p')
+            texts = []
+            for p in paragraphs:
+                # Skip if paragraph contains media
+                if p.find(['img', 'video', 'audio', 'iframe', 'picture']):
+                    continue
+                text = p.get_text(strip=True)
+                if text:
+                    texts.append(text)
+            # Also get div content that might be paragraphs
+            for div in soup.find_all('div', class_=lambda x: x and ('content' in x.lower() or 'text' in x.lower())):
+                # Skip if contains media
+                if div.find(['img', 'video', 'audio', 'iframe', 'picture']):
+                    continue
+                text = div.get_text(strip=True)
+                if text and len(text) > 50:
+                    # Check if it contains paragraphs we already have
+                    has_p = div.find('p')
+                    if not has_p:
+                        texts.append(text)
+            result = "\n\n".join(texts)
+            self.text_content_view.setPlainText(result)
+
+        elif display_type == "Text Sentences":
+            # All text as sentences
+            clean_text = ' '.join(all_text.split())
+            sentences = re.split(r'(?<=[.!?])\s+', clean_text)
+            sentences = [s.strip() for s in sentences if s.strip() and len(s) > 5]
+            text = "\n\n".join(sentences)
+            self.text_content_view.setPlainText(text)
+
+        elif display_type == "Text Unique Words":
+            # Unique words in order of first appearance
+            clean_text = ' '.join(all_text.split()).lower()
+            words = re.findall(r'\b[a-z]+\b', clean_text)
+            # Remove common stop words
+            stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'without',
+                          'by'}
+            words = [w for w in words if w not in stop_words and len(w) > 2]
+            unique_words = list(dict.fromkeys(words))  # Preserve order
+            text = "\n".join(unique_words)
+            self.text_content_view.setPlainText(text)
+
+        elif display_type == "Text Repeated Words":
+            # Repeated words with counts
+            clean_text = ' '.join(all_text.split()).lower()
+            words = re.findall(r'\b[a-z]+\b', clean_text)
+            # Remove common stop words
+            stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'without',
+                          'by'}
+            words = [w for w in words if w not in stop_words and len(w) > 2]
+            from collections import Counter
+            word_counts = Counter(words)
+            repeated = [(word, count) for word, count in word_counts.items() if count > 1]
+            repeated.sort(key=lambda x: x[1], reverse=True)
+            text = "\n".join([f"{word}: {count}" for word, count in repeated[:50]])  # Limit to top 50
+            self.text_content_view.setPlainText(text)
+
+        elif display_type == "Text Questions":
+            # Questions
+            clean_text = ' '.join(all_text.split())
+            questions = re.findall(r'[^.!?]*\?', clean_text)
+            questions = [q.strip() for q in questions if q.strip() and len(q) > 5]
+            text = "\n".join(questions)
+            self.text_content_view.setPlainText(text)
+
+        else:
+            # Default: show all text
+            texts = []
+            for tag in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+                if tag.find(['img', 'video', 'audio', 'iframe', 'picture']):
+                    continue
+                text = tag.get_text(strip=True)
+                if text:
+                    texts.append(text)
+            text = '\n\n'.join(texts)
+            self.text_content_view.setPlainText(text)
+
+    def _extract_all_elements(self, soup: BeautifulSoup) -> List[Dict]:
+        """Extract all meaningful elements from HTML"""
+        elements = []
+
+        # Get all meaningful tags
+        for element in soup.descendants:
+            if element.name is None:
+                continue
+
+            # Skip script, style, nav, header, footer
+            if element.name in ['script', 'style', 'nav', 'header', 'footer', 'aside']:
+                continue
+
+            # Get text content
+            text = element.get_text(strip=True)
+            if not text:
+                continue
+
+            # Skip very short text (likely not meaningful)
+            if len(text) < 3 and element.name not in ['h1', 'h2', 'h3']:
+                continue
+
+            # Determine element type
+            if element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                element_type = 'heading'
+            elif element.name == 'p':
+                element_type = 'paragraph'
+            elif element.name == 'li':
+                element_type = 'list_item'
+            elif element.name == 'blockquote':
+                element_type = 'quote'
+            elif element.name in ['div', 'section', 'article']:
+                # Only include if it has substantial text
+                if len(text) > 30:
+                    element_type = 'section'
+                else:
+                    continue
+            else:
+                continue
+
+            elements.append({
+                'type': element_type,
+                'content': text
+            })
+
+        return elements
 
     def _display_html_content(self, html_content):
         """Internal method to display HTML content without triggering recursion"""
@@ -1531,14 +1785,66 @@ class DataResearchView(QWidget):
         cursor = self.text_content_view.textCursor()
         has_selection = cursor.hasSelection()
         selected_text = cursor.selectedText() if has_selection else ""
-        # Store the selection start and end positions
         selection_start = cursor.selectionStart() if has_selection else -1
-        selection_end = cursor.selectionEnd() if has_selection else -1
 
         font_family = self.font_combo.currentText()
         font_size = self.font_size_spin.value()
         line_height = self.line_height_spin.value()
         word_spacing = 2.0
+
+        # Parse and clean HTML
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+        except Exception as e:
+            print(f"Error parsing HTML: {e}")
+            self.text_content_view.setPlainText("Error parsing HTML content.")
+            return
+
+        # Remove unwanted elements
+        for tag in soup.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside', 'noscript']):
+            tag.decompose()
+
+        # Remove media elements
+        for tag in soup.find_all(['img', 'video', 'audio', 'iframe', 'picture', 'source', 'svg']):
+            tag.decompose()
+
+        # Find the main content - try multiple strategies
+        main_content = None
+
+        # Strategy 1: Look for common content containers
+        main_content = (
+                soup.find('main') or
+                soup.find('article') or
+                soup.find('div', class_='main-dnd-area') or
+                soup.find('div', class_='body-container-wrapper') or
+                soup.find('div', class_='content-area') or
+                soup.find('div', class_='site-main') or
+                soup.find('div', class_='entry-content') or
+                soup.find('div', class_='single-content') or
+                soup.find('div', class_='content-wrap')
+        )
+
+        # Strategy 2: If no content container found, look for the body
+        if not main_content:
+            body = soup.find('body')
+            if body:
+                # Remove header, footer, nav from body
+                for tag in body.find_all(['header', 'footer', 'nav']):
+                    tag.decompose()
+                main_content = body
+            else:
+                main_content = soup
+
+        # Strategy 3: If the main content is still empty, get all text from the body
+        if not main_content or not main_content.get_text(strip=True):
+            body = soup.find('body')
+            if body:
+                # Get all text from body
+                main_content = body
+            else:
+                main_content = soup
+
+        html_content = str(main_content)
 
         doc = self.text_content_view.document()
         doc.setDefaultStyleSheet(f"""
@@ -1548,46 +1854,53 @@ class DataResearchView(QWidget):
                 line-height: {line_height};
                 word-spacing: {word_spacing}px;
                 padding: 30px 40px;
-                max-width: 850px;
+                max-width: 900px;
                 margin: 0 auto;
                 color: #2c3e50;
                 background-color: #ffffff;
             }}
             h1 {{
-                font-size: {font_size + 10}pt;
+                font-size: {font_size + 12}pt;
                 font-weight: bold;
-                margin-top: 30px;
+                margin-top: 28px;
                 margin-bottom: 14px;
                 color: #1a1a2e;
                 border-bottom: 3px solid #3498db;
                 padding-bottom: 10px;
             }}
             h2 {{
-                font-size: {font_size + 6}pt;
+                font-size: {font_size + 8}pt;
                 font-weight: bold;
                 margin-top: 24px;
-                margin-bottom: 10px;
+                margin-bottom: 12px;
                 color: #2c3e50;
                 border-bottom: 2px solid #ecf0f1;
                 padding-bottom: 8px;
             }}
             h3 {{
-                font-size: {font_size + 3}pt;
+                font-size: {font_size + 4}pt;
                 font-weight: bold;
                 margin-top: 20px;
-                margin-bottom: 8px;
+                margin-bottom: 10px;
                 color: #34495e;
             }}
-            h4, h5, h6 {{
-                font-size: {font_size + 1}pt;
+            h4 {{
+                font-size: {font_size + 2}pt;
                 font-weight: bold;
                 margin-top: 16px;
-                margin-bottom: 6px;
+                margin-bottom: 8px;
                 color: #445566;
             }}
-            p {{
+            h5, h6 {{
+                font-size: {font_size}pt;
+                font-weight: bold;
                 margin-top: 14px;
-                margin-bottom: 14px;
+                margin-bottom: 6px;
+                color: #556677;
+            }}
+            p {{
+                margin-top: 12px;
+                margin-bottom: 12px;
                 line-height: {line_height};
                 text-align: justify;
             }}
@@ -1599,47 +1912,40 @@ class DataResearchView(QWidget):
             }}
             a:hover {{ color: #1a5276; }}
             ul, ol {{
-                margin-top: 12px;
-                margin-bottom: 12px;
-                padding-left: 35px;
+                margin-top: 10px;
+                margin-bottom: 10px;
+                padding-left: 30px;
             }}
             li {{
-                margin-top: 6px;
-                margin-bottom: 6px;
+                margin-top: 4px;
+                margin-bottom: 4px;
                 line-height: {line_height};
             }}
             blockquote {{
-                margin: 18px 25px;
-                padding: 14px 24px;
-                border-left: 5px solid #3498db;
+                margin: 14px 20px;
+                padding: 12px 20px;
+                border-left: 4px solid #3498db;
                 background-color: #f8f9fa;
                 font-style: italic;
-                border-radius: 0 6px 6px 0;
-                color: #34495e;
             }}
             table {{
                 border-collapse: collapse;
-                margin: 18px 0;
+                margin: 14px 0;
                 width: 100%;
-                border-radius: 6px;
-                overflow: hidden;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
             }}
             th, td {{
                 border: 1px solid #dee2e6;
-                padding: 10px 16px;
+                padding: 8px 12px;
                 text-align: left;
             }}
             th {{
                 background-color: #e9ecef;
                 font-weight: 600;
-                color: #1a1a2e;
             }}
             tr:nth-child(even) {{ background-color: #f8f9fa; }}
-            tr:hover {{ background-color: #e8f0fe; }}
             code {{
                 background-color: #f4f4f4;
-                padding: 2px 8px;
+                padding: 2px 6px;
                 border-radius: 4px;
                 font-family: "Consolas", monospace;
                 font-size: 0.9em;
@@ -1647,13 +1953,12 @@ class DataResearchView(QWidget):
             }}
             pre {{
                 background-color: #f4f4f4;
-                padding: 14px 18px;
-                border-radius: 6px;
+                padding: 12px 16px;
+                border-radius: 4px;
                 overflow-x: auto;
                 font-family: "Consolas", monospace;
                 font-size: 0.9em;
-                margin: 14px 0;
-                border: 1px solid #e9ecef;
+                margin: 12px 0;
             }}
         """)
 
@@ -1667,20 +1972,36 @@ class DataResearchView(QWidget):
 
         # Restore selection if there was one
         if has_selection and selected_text and selection_start >= 0:
-            # Try to find the text
-            doc = self.text_content_view.document()
-            cursor = doc.find(selected_text)
-            if not cursor.isNull():
-                self.text_content_view.setTextCursor(cursor)
-                # After restoring, trigger selection changed
-                self.on_selection_changed()
-
+            try:
+                doc = self.text_content_view.document()
+                cursor = doc.find(selected_text)
+                if not cursor.isNull():
+                    self.text_content_view.setTextCursor(cursor)
+                    self.on_selection_changed()
+            except Exception:
+                pass
 
     def display_formatted_text(self, html_content):
         """Display HTML content with article styling"""
         if not html_content:
             self.text_content_view.clear()
             return
+
+        # Use raw HTML for better content extraction
+        page = self.pages[self.current_page_index] if self.current_page_index >= 0 else None
+        if page:
+            raw_html = page.get('raw_html', '')
+            if raw_html:
+                # Check if raw_html has meaningful content
+                soup = BeautifulSoup(raw_html, 'html.parser')
+                body = soup.find('body')
+                if body and len(body.get_text(strip=True)) > 100:
+                    html_content = raw_html
+                else:
+                    # Fallback to main_html
+                    main_html = page.get('main_html', '')
+                    if main_html:
+                        html_content = main_html
 
         self._display_html_content(html_content)
 
