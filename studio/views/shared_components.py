@@ -129,12 +129,11 @@ class ProjectCard(QFrame):
             }
         """)
 
+    # In shared_components.py, update _get_stats method:
     def _get_stats(self) -> str:
-        """Get project statistics based on type"""
         stats = []
 
         if self.project_data['project_type'] == ProjectType.DATA_TABLE.value:
-            # Data Table project stats - get row count
             try:
                 data_path = self.project_data.get('data_path')
                 if data_path and data_path != '':
@@ -150,7 +149,21 @@ class ProjectCard(QFrame):
                 stats.append("Rows: 0")
 
         elif self.project_data['project_type'] == ProjectType.DATA_RESEARCH.value:
-            # Research project stats
+            try:
+                data_path = self.project_data.get('data_path')
+                if data_path and data_path != '':
+                    conn = sqlite3.connect(data_path)
+                    cursor = conn.cursor()
+                    cursor.execute('SELECT COUNT(*) FROM pages')
+                    count = cursor.fetchone()[0]
+                    conn.close()
+                    stats.append(f"Pages: {count}")
+                else:
+                    stats.append("Pages: 0")
+            except Exception:
+                stats.append("Pages: 0")
+
+        elif self.project_data['project_type'] == ProjectType.DATA_DOCUMENT.value:
             try:
                 data_path = self.project_data.get('data_path')
                 if data_path and data_path != '':
@@ -175,7 +188,7 @@ class NewProjectDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("New Project")
         self.setModal(True)
-        self.setMinimumWidth(450)
+        self.setMinimumWidth(500)
         self.setup_ui()
 
     def setup_ui(self):
@@ -195,7 +208,16 @@ class NewProjectDialog(QDialog):
         for type_val, display_name in ProjectType.get_all_types():
             self.type_combo.addItem(display_name, type_val)
         self.type_combo.setStyleSheet("font-size: 14px; padding: 8px;")
+
+        # Add description label that updates when type changes
+        self.type_desc_label = QLabel("")
+        self.type_desc_label.setStyleSheet(
+            "color: #666; font-size: 11px; padding: 4px 8px; background-color: #f5f5f5; border-radius: 4px;")
+        self.type_desc_label.setWordWrap(True)
+        self.type_combo.currentIndexChanged.connect(self.update_type_description)
+
         layout.addWidget(self.type_combo)
+        layout.addWidget(self.type_desc_label)
 
         # Project Description
         layout.addWidget(QLabel("Description:"))
@@ -231,6 +253,15 @@ class NewProjectDialog(QDialog):
 
         self.setLayout(layout)
 
+        # Initialize description
+        self.update_type_description()
+
+    def update_type_description(self):
+        """Update the type description label"""
+        project_type = self.type_combo.currentData()
+        description = ProjectType.get_description(project_type)
+        self.type_desc_label.setText(f"ℹ️ {description}")
+
     def get_project_data(self):
         """Get the project data from the dialog"""
         name = self.name_input.text().strip()
@@ -241,10 +272,15 @@ class NewProjectDialog(QDialog):
         if project_type == ProjectType.DATA_TABLE.value:
             metadata = {
                 'column_config': [
-                    {'name': 'ID', 'type': 'text', 'required': True},
+                    {'name': 'ID', 'type': 'integer', 'required': True},
                     {'name': 'Name', 'type': 'text', 'required': True},
                     {'name': 'Description', 'type': 'text', 'required': False}
                 ]
+            }
+        elif project_type == ProjectType.DATA_DOCUMENT.value:
+            metadata = {
+                'document_count': 0,
+                'page_count': 0
             }
         else:
             metadata = {}

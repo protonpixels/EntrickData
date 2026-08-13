@@ -107,21 +107,26 @@ class MainWindow(QMainWindow):
             self.tab_widget.setCurrentIndex(tab_index)
             return
 
-        # Sync schema with metadata for data table projects
-        if project_data['project_type'] == ProjectType.DATA_TABLE.value:
-            self.db.sync_schema_with_metadata(project_id)
-            # Reload project data after sync
-            project_data = self.db.get_project(project_id)
-
-        # Import views here to avoid circular imports
+        # Import views
         from views.data_table_view import DataTableView
         from views.data_research_view import DataResearchView
+        from views.data_document_view import DataDocumentView
+        from views.data_chat_view import DataChatView  # Add this import
+
+        # Sync schema for data table projects
+        if project_data['project_type'] == ProjectType.DATA_TABLE.value:
+            self.db.sync_schema_with_metadata(project_id)
+            project_data = self.db.get_project(project_id)
 
         # Create appropriate view based on project type
         if project_data['project_type'] == ProjectType.DATA_TABLE.value:
             view = DataTableView(self, self.db, project_data)
-        else:
+        elif project_data['project_type'] == ProjectType.DATA_RESEARCH.value:
             view = DataResearchView(self, self.db, project_data)
+        elif project_data['project_type'] == ProjectType.DATA_DOCUMENT.value:
+            view = DataDocumentView(self, self.db, project_data)
+        else:  # DATA_CHAT
+            view = DataChatView(self, self.db, project_data)
 
         # Add tab
         tab_name = f"{project_data['name']}"

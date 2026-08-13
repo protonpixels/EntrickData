@@ -85,7 +85,7 @@ class StudioDatabase:
             ''')
 
         elif project_type == ProjectType.DATA_RESEARCH.value:
-            # Data Research project schema (from data_browser)
+            # Data Research project schema
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS pages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,25 +99,24 @@ class StudioDatabase:
                     fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            # ... rest of research schema
 
+        elif project_type == ProjectType.DATA_DOCUMENT.value:
+            # Data Document project schema - same as research but with document-specific metadata
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS elements (
+                CREATE TABLE IF NOT EXISTS pages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    page_id INTEGER,
-                    element_type TEXT,
-                    position INTEGER,
-                    content TEXT,
-                    html_fragment TEXT,
-                    attributes TEXT,
-                    FOREIGN KEY (page_id) REFERENCES pages (id) ON DELETE CASCADE
+                    url TEXT,
+                    title TEXT,
+                    main_text TEXT,
+                    main_html TEXT,
+                    metadata TEXT,
+                    raw_html TEXT,
+                    content_hash TEXT,
+                    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-
-            cursor.execute('''
-                CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(
-                    title, main_text, content_hash
-                )
-            ''')
+            # Remove UNIQUE constraint on url for documents
 
         conn.commit()
         conn.close()

@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QTextEdit, QListWidget, QListWidgetItem, QSplitter,
     QTabWidget, QScrollArea, QFrame, QMessageBox,
     QFileDialog, QDialog, QSpinBox, QDoubleSpinBox,
-    QTextBrowser, QSizePolicy, QGroupBox, QCompleter, QRadioButton
+    QTextBrowser, QSizePolicy, QGroupBox, QCompleter, QRadioButton, QInputDialog
 )
 from PySide6.QtGui import (
     QClipboard, QGuiApplication, QFont, QColor,
@@ -628,7 +628,44 @@ class DataResearchView(QWidget):
         name_label.setStyleSheet("font-weight: bold; font-size: 16px; color: #1c242e;")
         top_bar.addWidget(name_label)
 
+        # Page URL label
+        self.page_url_label = QLabel("")
+        self.page_url_label.setStyleSheet("color: #666; font-size: 12px; font-family: monospace;")
+
+        top_bar.addWidget(self.page_url_label)
+
         top_bar.addStretch()
+
+        # Page management buttons
+        rename_page_btn = QPushButton("✏️ Rename Page")
+        rename_page_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                font-weight: bold;
+                padding: 4px 10px;
+                border-radius: 4px;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #1976D2; }
+        """)
+        rename_page_btn.clicked.connect(self.rename_page)
+        top_bar.addWidget(rename_page_btn)
+
+        delete_page_btn = QPushButton("🗑️ Delete Page")
+        delete_page_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                font-weight: bold;
+                padding: 4px 10px;
+                border-radius: 4px;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #d32f2f; }
+        """)
+        delete_page_btn.clicked.connect(self.delete_current_page)
+        top_bar.addWidget(delete_page_btn)
 
         # Page count label
         self.page_count_label = QLabel("Pages: 0")
@@ -749,13 +786,14 @@ class DataResearchView(QWidget):
 
         # Page list
         self.page_list = QListWidget()
+        self.page_list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # Allow keyboard focus
         self.page_list.itemClicked.connect(self.on_page_selected)
         self.page_list.setStyleSheet("""
-            QListWidget::item:hover { background-color: #e0f0ff; }
-            QListWidget::item:selected { background-color: #4CAF50; color: white; }
-        """)
+                    QListWidget::item:hover { background-color: #e0f0ff; }
+                    QListWidget::item:selected { background-color: #4CAF50; color: white; }
+                """)
         left_layout.addWidget(self.page_list)
-
+        # In the setup_ui method, update the page_list creation:
         splitter.addWidget(left_widget)
 
         # Right panel: Content display
@@ -1195,6 +1233,11 @@ class DataResearchView(QWidget):
         self.current_page_index = index
         self.base_url = page.get('url', '')
 
+        # Update URL label
+        url = page.get('url', '')
+        self.page_url_label.setText(f"📎 {url[:80]}{'...' if len(url) > 80 else ''}")
+        self.page_url_label.setToolTip(url)
+
         # Get elements for this page
         all_elements = self.db.get_elements_for_page(self.data_path, page['id'])
         self.elements = [e for e in all_elements if e.get('type') != 'section']
@@ -1212,7 +1255,7 @@ class DataResearchView(QWidget):
         else:
             self.display_formatted_text(main_html)
 
-        # Display links
+        # Display links with better styling
         self.display_links()
 
         # Display media
@@ -1229,18 +1272,101 @@ class DataResearchView(QWidget):
         self.clear_full_text_highlights()
 
     def display_links(self):
-        """Display links in the Links tab"""
+        """Display links in the Links tab with better styling"""
         if not self.links:
             self.links_view.setText("No links found on this page.")
             return
 
-        text = "=== LINKS ===\n\n"
-        for i, link in enumerate(self.links, 1):
-            text += f"[{i}] Text: {link['text']}\n"
-            text += f"    URL: {link['url']}\n"
-            text += f"    HTML: {link['html'][:100]}...\n\n"
+        # Use HTML for better formatting
+        html_parts = []
+        html_parts.append('<style>')
+        html_parts.append('''
+            body { 
+                font-family: 'Segoe UI', Arial, sans-serif;
+                padding: 20px;
+                line-height: 1.6;
+                color: #2c3e50;
+            }
+            .link-container {
+                border: 1px solid #e0e0e0;
+                border-radius: 8px;
+                padding: 12px 16px;
+                margin-bottom: 10px;
+                background-color: #fafafa;
+                transition: all 0.2s;
+            }
+            .link-container:hover {
+                background-color: #f0f4f8;
+                border-color: #4CAF50;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            }
+            .link-number {
+                font-weight: bold;
+                color: #4CAF50;
+                font-size: 14px;
+                margin-right: 8px;
+            }
+            .link-text {
+                font-weight: 600;
+                color: #1a1a2e;
+                font-size: 14px;
+                word-break: break-word;
+            }
+            .link-url {
+                display: block;
+                color: #2980b9;
+                font-size: 12px;
+                font-family: 'Consolas', monospace;
+                word-break: break-all;
+                margin-top: 4px;
+                padding: 4px 8px;
+                background-color: #f0f8ff;
+                border-radius: 4px;
+                border-left: 3px solid #2980b9;
+            }
+            .link-url a {
+                color: #2980b9;
+                text-decoration: none;
+            }
+            .link-url a:hover {
+                text-decoration: underline;
+            }
+            .link-html {
+                display: block;
+                color: #888;
+                font-size: 11px;
+                font-family: 'Consolas', monospace;
+                margin-top: 4px;
+                padding: 6px 8px;
+                background-color: #f5f5f5;
+                border-radius: 4px;
+                border: 1px solid #eee;
+                word-break: break-all;
+                max-height: 60px;
+                overflow: hidden;
+            }
+            .link-html pre {
+                margin: 0;
+                white-space: pre-wrap;
+                word-break: break-all;
+            }
+        ''')
+        html_parts.append('</style>')
 
-        self.links_view.setText(text)
+        html_parts.append(
+            '<h2 style="border-bottom: 2px solid #4CAF50; padding-bottom: 8px; margin-bottom: 16px;">🔗 Links Found</h2>')
+
+        for i, link in enumerate(self.links, 1):
+            html_parts.append(f'<div class="link-container">')
+            html_parts.append(f'<span class="link-number">#{i}</span>')
+            html_parts.append(f'<span class="link-text">{link["text"]}</span>')
+            html_parts.append(
+                f'<div class="link-url">🔗 <a href="{link["url"]}" target="_blank">{link["url"]}</a></div>')
+            html_parts.append(
+                f'<div class="link-html"><pre>{link["html"][:150]}{"..." if len(link["html"]) > 150 else ""}</pre></div>')
+            html_parts.append('</div>')
+
+        self.links_view.setHtml('\n'.join(html_parts))
 
     def display_media(self):
         """Display media in the Media tab"""
@@ -2414,20 +2540,39 @@ class DataResearchView(QWidget):
 
     def keyPressEvent(self, event: QKeyEvent):
         """Handle keyboard shortcuts"""
+        # Check if page list has focus or no widget has focus
+        if (self.page_list.hasFocus() or not self.focusWidget()) and (
+                event.key() == Qt.Key_Up or event.key() == Qt.Key_Down):
+            # Navigate pages with arrow keys
+            current_row = self.page_list.currentRow()
+            if event.key() == Qt.Key_Up:
+                new_row = max(0, current_row - 1)
+            else:  # Down
+                new_row = min(self.page_list.count() - 1, current_row + 1)
+
+            if new_row != current_row:
+                self.page_list.setCurrentRow(new_row)
+                # Get the page ID from the item
+                item = self.page_list.item(new_row)
+                if item:
+                    page_id = item.data(Qt.UserRole)
+                    for i, page in enumerate(self.pages):
+                        if page['id'] == page_id:
+                            self.display_page(i)
+                            break
+            return
+
+        # Ctrl+Enter - insert selected text
         if event.key() == Qt.Key_Return and event.modifiers() == Qt.ControlModifier:
-            # Ctrl+Enter - insert selected text
-            # Check if we have a selection and the button is enabled
             if self.insert_btn.isEnabled():
                 self.insert_selected_text()
             else:
-                # If button is disabled, show a message explaining why
                 project_selected = self.project_combo.currentData() is not None
                 column_selected = self.column_combo.currentData() is not None
 
                 if not project_selected or not column_selected:
                     QMessageBox.warning(self, "Incomplete", "Please select both a project and a column first.")
                 else:
-                    # Check if there's a selection
                     current_tab = self.tabs.currentWidget()
                     if hasattr(current_tab, 'textCursor'):
                         cursor = current_tab.textCursor()
@@ -2436,8 +2581,6 @@ class DataResearchView(QWidget):
             return
 
         super().keyPressEvent(event)
-
-
 
     def on_selection_changed(self):
         """Handle selection changes in any tab"""
@@ -3186,4 +3329,79 @@ class DataResearchView(QWidget):
         if reply == QMessageBox.Yes:
             self.editor_view.setPlainText(cleaned_text)
             QMessageBox.information(self, "Cleaned", "Text has been cleaned.")
+
+    def rename_page(self):
+        """Rename/Edit the title of the current page"""
+        if self.current_page_index < 0 or self.current_page_index >= len(self.pages):
+            QMessageBox.warning(self, "Error", "No page selected.")
+            return
+
+        page = self.pages[self.current_page_index]
+        current_title = page.get('title', 'Untitled')
+
+        new_title, ok = QInputDialog.getText(
+            self,
+            "Edit Page Name",
+            "Enter new page name:",
+            text=current_title
+        )
+
+        if ok and new_title:
+            # Update in database
+            conn = sqlite3.connect(self.data_path)
+            cursor = conn.cursor()
+            cursor.execute("UPDATE pages SET title = ? WHERE id = ?", (new_title, page['id']))
+            conn.commit()
+            conn.close()
+
+            # Update local data
+            self.pages[self.current_page_index]['title'] = new_title
+
+            # Refresh display
+            self.load_pages()
+            # Reselect the current page
+            for i, p in enumerate(self.pages):
+                if p['id'] == page['id']:
+                    self.page_list.setCurrentRow(i)
+                    self.display_page(i)
+                    break
+
+            self.update_status(f"✅ Page renamed to: {new_title}")
+
+    def delete_current_page(self):
+        """Delete the current page"""
+        if self.current_page_index < 0 or not self.pages:
+            QMessageBox.warning(self, "Error", "No page selected.")
+            return
+
+        page = self.pages[self.current_page_index]
+        title = page.get('title', 'Untitled')
+
+        reply = QMessageBox.question(
+            self,
+            "Delete Page",
+            f"Are you sure you want to delete page:\n\n'{title}'\n\nThis action cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            # Delete from database
+            conn = sqlite3.connect(self.data_path)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM pages WHERE id = ?", (page['id'],))
+            conn.commit()
+            conn.close()
+
+            # Reload pages
+            self.load_pages()
+
+            # If no pages left, clear display
+            if not self.pages:
+                self.clear_display()
+            else:
+                # Select the first page
+                self.page_list.setCurrentRow(0)
+                self.display_page(0)
+
+            self.update_status(f"🗑️ Deleted page: {title}")
 

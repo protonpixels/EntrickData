@@ -46,3 +46,4 @@ class ColumnType(Enum):
     @classmethod
     def is_media_type(cls, type_val):
         return type_val in [cls.IMAGE.value, cls.VIDEO.value, cls.AUDIO.value]
+
