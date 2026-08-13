@@ -22,6 +22,8 @@ studio/projects/data_tables/
 **/projects/*.db
 studio/cache
 
+**/ai_model/models/qwen2.5-1.5b-instruct.gguf
+
 # IDE
 .vscode/
 .idea/
