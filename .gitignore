@@ -23,6 +23,7 @@ studio/projects/data_tables/
 studio/cache
 
 **/ai_model/models/qwen2.5-1.5b-instruct.gguf
+**/ai_model/models/*.gguf
 **/vector_store.pkl
 # IDE
 .vscode/
