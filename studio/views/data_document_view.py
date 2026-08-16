@@ -511,7 +511,7 @@ class DataDocumentView(QWidget):
         self.text_content_view = QTextBrowser()
         self.text_content_view.selectionChanged.connect(self.on_selection_changed)
         self.text_content_view.setFont(QFont("Georgia", 12))
-        self.text_content_view.setStyleSheet("padding: 30px; background-color: #fcfcfc; border: none;")
+        self.text_content_view.setStyleSheet("padding: 30px; background-color: #fcfcfc; border: none; direction: ltr !important;")
         self.text_content_view.anchorClicked.connect(self.on_link_clicked)
         self.tabs.addTab(self.text_content_view, "📝 Text Content")
 

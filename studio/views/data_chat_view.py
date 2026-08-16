@@ -17,7 +17,8 @@ from PySide6.QtWidgets import (
     QTabWidget, QScrollArea, QFrame, QMessageBox,
     QFileDialog, QDialog, QSpinBox, QDoubleSpinBox,
     QTextBrowser, QSizePolicy, QGroupBox, QProgressDialog,
-    QCheckBox, QProgressBar, QMenu, QInputDialog
+    QCheckBox, QProgressBar, QMenu, QInputDialog,
+    QDialogButtonBox
 )
 from PySide6.QtGui import (
     QClipboard, QGuiApplication, QFont, QColor,
@@ -41,6 +42,482 @@ MODEL_DIR = os.path.join(BASE_DIR, "ai_model", "models")
 DEFAULT_MODEL_PATH = os.path.join(MODEL_DIR, "qwen2.5-1.5b-instruct.gguf")
 VECTOR_STORE_PATH = os.path.join(BASE_DIR, "vector_store.pkl")
 
+class ContextualProcessor:
+    """
+    Advanced processing pipeline: ordering, synthesis method, clustering,
+    article generation, and final synthesis.
+    """
+    def __init__(self, query: str, chunks: List[str], project_names: List[str],
+                 llm, settings: dict, progress_callback=None):
+        self.query = query
+        self.chunks = chunks
+        self.project_names = project_names
+        self.llm = llm
+        self.settings = settings
+        self.progress_callback = progress_callback
+        self.temperature = settings.get('temperature', 0.7)
+        self.top_p = settings.get('top_p', 0.9)
+        self.batch_size = settings.get('batch_size', 5)
+        self.max_tokens = settings.get('max_tokens', 500)
+        self.order = settings.get('order', 'Most Relevant First')
+        self.synthesis = settings.get('synthesis', 'Contextual Linking')
+        self.cluster_count = settings.get('cluster_count', 3)
+        self.drop_threshold = settings.get('drop_threshold', 0.3)
+
+        # Step 1: Order chunks
+        self.ordered_chunks = self._order_chunks()
+        self.project_names_ordered = self._order_project_names()
+
+        # Step 2: Process batches with chosen synthesis
+        self.summaries = self._process_batches()
+
+        # Step 3: Cluster summaries
+        self.clusters = self._cluster_summaries()
+
+        # Step 4: Generate articles from clusters
+        self.articles = self._generate_articles()
+
+        # Step 5: Final synthesis
+        self.final_answer = self._final_synthesis()
+
+    def _order_chunks(self) -> List[str]:
+        """Order chunks according to user setting."""
+        if self.order == 'Most Relevant First':
+            scorer = MLRelevanceScorer(self.chunks, self.query)
+            scored = [(chunk, scorer.score_chunk(chunk)) for chunk in self.chunks]
+            scored.sort(key=lambda x: x[1], reverse=True)
+            return [chunk for chunk, _ in scored]
+        elif self.order == 'Least Relevant First':
+            scorer = MLRelevanceScorer(self.chunks, self.query)
+            scored = [(chunk, scorer.score_chunk(chunk)) for chunk in self.chunks]
+            scored.sort(key=lambda x: x[1])
+            return [chunk for chunk, _ in scored]
+        elif self.order == 'A-Z':
+            return self.chunks
+        elif self.order == 'Z-A':
+            return list(reversed(self.chunks))
+        else:
+            return self.chunks
+
+    def _order_project_names(self) -> List[str]:
+        chunk_to_project = {}
+        for i, chunk in enumerate(self.chunks):
+            chunk_to_project[chunk] = self.project_names[i]
+        return [chunk_to_project[chunk] for chunk in self.ordered_chunks]
+
+    def _process_batches(self) -> List[str]:
+        summaries = []
+        total_chunks = len(self.ordered_chunks)
+        total_batches = (total_chunks + self.batch_size - 1) // self.batch_size
+        last_chunk = ""
+
+        for batch_num in range(total_batches):
+            start = batch_num * self.batch_size
+            end = min(start + self.batch_size, total_chunks)
+            batch = self.ordered_chunks[start:end]
+            batch_projects = self.project_names_ordered[start:end]
+
+            if self.synthesis == 'Contextual Linking' and last_chunk:
+                batch_with_context = [last_chunk] + batch
+            else:
+                batch_with_context = batch
+
+            context = '\n\n'.join(batch_with_context)
+
+            if self.synthesis == 'Summarization':
+                prompt = self._summarization_prompt(context, batch_num+1, total_batches)
+            elif self.synthesis == 'Claim Listing':
+                prompt = self._claim_listing_prompt(context, summaries, batch_num+1, total_batches)
+            else:  # Contextual Linking
+                prev_summary = summaries[-1] if summaries else "None"
+                prompt = self._contextual_linking_prompt(context, prev_summary, batch_num+1, total_batches)
+
+            response = self._call_llm(prompt, max_tokens=100)
+            if response:
+                summaries.append(response)
+                if self.synthesis == 'Contextual Linking' and batch:
+                    last_chunk = batch[-1]
+
+                if self.progress_callback:
+                    self.progress_callback('batch', batch_num+1, total_batches, response, batch_projects[0] if batch_projects else '')
+
+        return summaries
+
+    def _summarization_prompt(self, context: str, batch_num: int, total: int) -> str:
+        return f"""Summarize the key points from the following text (batch {batch_num} of {total}):
+
+{context}
+
+Provide a concise summary (4-10 sentences)."""
+
+    def _claim_listing_prompt(self, context: str, previous_summaries: List[str], batch_num: int, total: int) -> str:
+        prev_claims = '\n'.join(previous_summaries) if previous_summaries else "None"
+        return f"""List every unique claim or fact from the following text (batch {batch_num} of {total}) that is NOT already mentioned in the previous claims.
+
+Previous claims:
+{prev_claims}
+
+New text:
+{context}
+
+List each new claim as a separate sentence. Do not repeat previous claims."""
+
+    def _contextual_linking_prompt(self, context: str, prev_summary: str, batch_num: int, total: int) -> str:
+        return f"""Given the previous summary of earlier information:
+{prev_summary}
+
+Now read the new text (batch {batch_num} of {total}):
+{context}
+
+Identify any new insights, concepts, or ideas that are NOT covered in the previous summary. Provide a brief summary of these new elements (2-10 sentences). Focus only on what is novel."""
+
+    def _call_llm(self, prompt: str, max_tokens: int) -> str:
+        try:
+            response = self.llm(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                stop=["###", "---", "```"]
+            )
+            content = response['choices'][0]['text'].strip()
+            return content if content else ""
+        except Exception as e:
+            print(f"⚠️ LLM call error: {e}")
+            return ""
+
+    def _cluster_summaries(self) -> List[List[str]]:
+        if not self.summaries:
+            return []
+
+        # Score summaries for relevance to query to find anchors
+        scorer = MLRelevanceScorer(self.summaries, self.query)
+        scored = [(summary, scorer.score_chunk(summary)) for summary in self.summaries]
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        anchors = scored[:self.cluster_count]
+        anchor_indices = [self.summaries.index(summary) for summary, _ in anchors]
+
+        # Create vectorizer for computing similarity between summaries
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        vectorizer = TfidfVectorizer(max_features=100, stop_words='english')
+        summary_vectors = vectorizer.fit_transform(self.summaries)
+
+        clusters = []
+        for anchor_idx in anchor_indices:
+            cluster = [self.summaries[anchor_idx]]
+            anchor_vector = summary_vectors[anchor_idx]
+
+            # Expand backwards
+            idx = anchor_idx - 1
+            while idx >= 0:
+                sim = cosine_similarity(anchor_vector, summary_vectors[idx])[0][0]
+                if sim < self.drop_threshold:
+                    break
+                cluster.insert(0, self.summaries[idx])
+                idx -= 1
+
+            # Expand forwards
+            idx = anchor_idx + 1
+            while idx < len(self.summaries):
+                sim = cosine_similarity(anchor_vector, summary_vectors[idx])[0][0]
+                if sim < self.drop_threshold:
+                    break
+                cluster.append(self.summaries[idx])
+                idx += 1
+
+            clusters.append(cluster)
+
+        return clusters
+
+    def _generate_articles(self) -> List[str]:
+        articles = []
+        for i, cluster in enumerate(self.clusters):
+            cluster_text = '\n\n'.join(cluster)
+            prompt = f"""Write a coherent article based on the following insights (Cluster {i+1}).
+
+Insights:
+{cluster_text}
+
+The article should flow logically and cover all the key points. Keep it concise but comprehensive."""
+            article = self._call_llm(prompt, max_tokens=400)
+            if article:
+                articles.append(article)
+                if self.progress_callback:
+                    self.progress_callback('article', i+1, len(self.clusters), article, '')
+        return articles
+
+    def _final_synthesis(self) -> str:
+        if not self.articles:
+            return "No articles generated."
+
+        scorer = MLRelevanceScorer(self.articles, self.query)
+        scored = [(article, scorer.score_chunk(article)) for article in self.articles]
+        scored.sort(key=lambda x: x[1])  # least to most relevant
+
+        final_text = '\n\n'.join([article for article, _ in scored])
+        prompt = f"""Synthesize the following articles into a single, comprehensive final answer to the query: "{self.query}".
+
+Articles (ordered from least to most relevant):
+{final_text}
+
+Create a final answer that integrates all the information, highlights the most important points, and provides a clear, structured response."""
+        final = self._call_llm(prompt, max_tokens=600)
+        return final if final else final_text
+
+class MLRelevanceScorer:
+    """
+    Score chunks by relevance to a query using TF-IDF and cosine similarity.
+    Precomputes scores for all chunks in the corpus.
+    """
+
+    def __init__(self, chunks: List[str], query: str, max_features: int = 1000):
+        self.chunks = chunks
+        self.query = query
+        self.vectorizer = TfidfVectorizer(
+            stop_words='english',
+            max_features=max_features,
+            ngram_range=(1, 2)
+        )
+        # Fit on all chunks
+        self.vectors = self.vectorizer.fit_transform(chunks)
+        self.query_vector = self.vectorizer.transform([query])
+        # Precompute similarities
+        self.scores = cosine_similarity(self.query_vector, self.vectors).flatten()
+        self.score_dict = {chunk: score for chunk, score in zip(chunks, self.scores)}
+
+    def score_chunk(self, chunk: str) -> float:
+        """Return precomputed score for a chunk."""
+        return self.score_dict.get(chunk, 0.0)
+class SettingsDialog(QDialog):
+    """Dialog for processing settings."""
+
+    def __init__(self, parent=None, current_settings=None):
+        super().__init__(parent)
+        self.setWindowTitle("⚙️ Processing Settings")
+        self.setMinimumSize(500, 450)
+
+        layout = QVBoxLayout(self)
+
+        # Processing Mode - ALL 5 MODES
+        layout.addWidget(QLabel("Processing Mode:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems([
+            "Relevancy",
+            "Sequential",
+            "Hierarchical",
+            "Contextual",
+            "Sentence Clustering"   # <-- NEW MODE
+        ])
+        if current_settings and 'mode' in current_settings:
+            idx = self.mode_combo.findText(current_settings['mode'])
+            if idx >= 0:
+                self.mode_combo.setCurrentIndex(idx)
+        self.mode_combo.currentTextChanged.connect(self._update_visibility)
+        layout.addWidget(self.mode_combo)
+
+        # Relevancy/Hierarchical specific settings
+        self.relevancy_group = QGroupBox("Relevancy Settings")
+        relevancy_layout = QVBoxLayout(self.relevancy_group)
+
+        h1 = QHBoxLayout()
+        h1.addWidget(QLabel("Top K per Project:"))
+        self.top_k_spinner = QSpinBox()
+        self.top_k_spinner.setRange(1, 1000)
+        self.top_k_spinner.setValue(20)
+        if current_settings and 'top_k' in current_settings:
+            self.top_k_spinner.setValue(current_settings['top_k'])
+        h1.addWidget(self.top_k_spinner)
+        h1.addStretch()
+        relevancy_layout.addLayout(h1)
+
+        self.process_all_check = QCheckBox("Process all chunks (ignore Top K)")
+        self.process_all_check.setChecked(False)
+        if current_settings and 'process_all' in current_settings:
+            self.process_all_check.setChecked(current_settings['process_all'])
+        relevancy_layout.addWidget(self.process_all_check)
+
+        layout.addWidget(self.relevancy_group)
+
+        # Sequential specific settings
+        self.seq_group = QGroupBox("Sequential Settings")
+        seq_layout = QVBoxLayout(self.seq_group)
+
+        h_target = QHBoxLayout()
+        h_target.addWidget(QLabel("Target Chunks per Project:"))
+        self.target_chunks_spinner = QSpinBox()
+        self.target_chunks_spinner.setRange(1, 50)
+        self.target_chunks_spinner.setValue(10)
+        if current_settings and 'target_chunks' in current_settings:
+            self.target_chunks_spinner.setValue(current_settings['target_chunks'])
+        h_target.addWidget(self.target_chunks_spinner)
+        h_target.addStretch()
+        seq_layout.addLayout(h_target)
+
+        seq_layout.addWidget(QLabel("Processes all chunks in original order (A-Z)."))
+        layout.addWidget(self.seq_group)
+
+        # Contextual specific settings
+        self.contextual_group = QGroupBox("Contextual Settings")
+        contextual_layout = QVBoxLayout(self.contextual_group)
+
+        h_order = QHBoxLayout()
+        h_order.addWidget(QLabel("Chunk Order:"))
+        self.order_combo = QComboBox()
+        self.order_combo.addItems(["Most Relevant First", "Least Relevant First", "A-Z", "Z-A"])
+        if current_settings and 'order' in current_settings:
+            idx = self.order_combo.findText(current_settings['order'])
+            if idx >= 0:
+                self.order_combo.setCurrentIndex(idx)
+        h_order.addWidget(self.order_combo)
+        contextual_layout.addLayout(h_order)
+
+        h_synth = QHBoxLayout()
+        h_synth.addWidget(QLabel("Synthesis Method:"))
+        self.synth_combo = QComboBox()
+        self.synth_combo.addItems(["Summarization", "Claim Listing", "Contextual Linking"])
+        if current_settings and 'synthesis' in current_settings:
+            idx = self.synth_combo.findText(current_settings['synthesis'])
+            if idx >= 0:
+                self.synth_combo.setCurrentIndex(idx)
+        h_synth.addWidget(self.synth_combo)
+        contextual_layout.addLayout(h_synth)
+
+        h_cluster = QHBoxLayout()
+        h_cluster.addWidget(QLabel("Number of Clusters:"))
+        self.cluster_spin = QSpinBox()
+        self.cluster_spin.setRange(1, 10)
+        self.cluster_spin.setValue(3)
+        if current_settings and 'cluster_count' in current_settings:
+            self.cluster_spin.setValue(current_settings['cluster_count'])
+        h_cluster.addWidget(self.cluster_spin)
+        contextual_layout.addLayout(h_cluster)
+
+        h_thresh = QHBoxLayout()
+        h_thresh.addWidget(QLabel("Relevance Drop Threshold:"))
+        self.thresh_spin = QDoubleSpinBox()
+        self.thresh_spin.setRange(0.0, 1.0)
+        self.thresh_spin.setSingleStep(0.05)
+        self.thresh_spin.setValue(0.3)
+        if current_settings and 'drop_threshold' in current_settings:
+            self.thresh_spin.setValue(current_settings['drop_threshold'])
+        h_thresh.addWidget(self.thresh_spin)
+        contextual_layout.addLayout(h_thresh)
+
+        layout.addWidget(self.contextual_group)
+
+        # Sentence Clustering specific settings
+        self.cluster_group = QGroupBox("Sentence Clustering Settings")
+        cluster_layout = QVBoxLayout(self.cluster_group)
+
+        # Relevancy threshold
+        h_sent_thresh = QHBoxLayout()
+        h_sent_thresh.addWidget(QLabel("Sentence Relevancy Threshold:"))
+        self.sentence_thresh_spin = QDoubleSpinBox()
+        self.sentence_thresh_spin.setRange(0.0, 1.0)
+        self.sentence_thresh_spin.setSingleStep(0.05)
+        self.sentence_thresh_spin.setValue(0.5)
+        if current_settings and 'sentence_threshold' in current_settings:
+            self.sentence_thresh_spin.setValue(current_settings['sentence_threshold'])
+        h_sent_thresh.addWidget(self.sentence_thresh_spin)
+        cluster_layout.addLayout(h_sent_thresh)
+
+        # Clustering levels
+        h_levels = QHBoxLayout()
+        h_levels.addWidget(QLabel("Further Clustering Levels:"))
+        self.levels_spin = QSpinBox()
+        self.levels_spin.setRange(0, 5)
+        self.levels_spin.setValue(0)
+        if current_settings and 'clustering_levels' in current_settings:
+            self.levels_spin.setValue(current_settings['clustering_levels'])
+        h_levels.addWidget(self.levels_spin)
+        cluster_layout.addLayout(h_levels)
+
+        # Top K clusters for final context
+        h_topk = QHBoxLayout()
+        h_topk.addWidget(QLabel("Top K Clusters for Answer:"))
+        self.topk_clusters_spin = QSpinBox()
+        self.topk_clusters_spin.setRange(1, 50)
+        self.topk_clusters_spin.setValue(5)
+        if current_settings and 'top_k_clusters' in current_settings:
+            self.topk_clusters_spin.setValue(current_settings['top_k_clusters'])
+        h_topk.addWidget(self.topk_clusters_spin)
+        cluster_layout.addLayout(h_topk)
+
+        layout.addWidget(self.cluster_group)
+        self.cluster_group.setVisible(False)  # hidden by default
+
+        # Common settings
+        common_group = QGroupBox("Common Settings")
+        common_layout = QVBoxLayout(common_group)
+
+        h2 = QHBoxLayout()
+        h2.addWidget(QLabel("Batch Size:"))
+        self.batch_size_spinner = QSpinBox()
+        self.batch_size_spinner.setRange(1, 20)
+        self.batch_size_spinner.setValue(5)
+        if current_settings and 'batch_size' in current_settings:
+            self.batch_size_spinner.setValue(current_settings['batch_size'])
+        h2.addWidget(self.batch_size_spinner)
+        h2.addStretch()
+        common_layout.addLayout(h2)
+
+        h3 = QHBoxLayout()
+        h3.addWidget(QLabel("Max Tokens per Chunk:"))
+        self.max_tokens_spinner = QSpinBox()
+        self.max_tokens_spinner.setRange(100, 4096)
+        self.max_tokens_spinner.setValue(500)
+        if current_settings and 'max_tokens' in current_settings:
+            self.max_tokens_spinner.setValue(current_settings['max_tokens'])
+        h3.addWidget(self.max_tokens_spinner)
+        h3.addStretch()
+        common_layout.addLayout(h3)
+
+        layout.addWidget(common_group)
+
+        # Buttons
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+        self._update_visibility(self.mode_combo.currentText())
+
+    def _update_visibility(self, mode: str):
+        self.relevancy_group.setVisible(mode in ["Relevancy", "Hierarchical"])
+        self.seq_group.setVisible(mode == "Sequential")
+        self.contextual_group.setVisible(mode == "Contextual")
+        self.cluster_group.setVisible(mode == "Sentence Clustering")
+
+    def get_settings(self) -> dict:
+        settings = {
+            'mode': self.mode_combo.currentText(),
+            'top_k': self.top_k_spinner.value(),
+            'process_all': self.process_all_check.isChecked(),
+            'batch_size': self.batch_size_spinner.value(),
+            'max_tokens': self.max_tokens_spinner.value(),
+            'target_chunks': self.target_chunks_spinner.value() if hasattr(self, 'target_chunks_spinner') else 10,
+        }
+
+        # Contextual settings
+        if hasattr(self, 'order_combo'):
+            settings['order'] = self.order_combo.currentText()
+        if hasattr(self, 'synth_combo'):
+            settings['synthesis'] = self.synth_combo.currentText()
+        if hasattr(self, 'cluster_spin'):
+            settings['cluster_count'] = self.cluster_spin.value()
+        if hasattr(self, 'thresh_spin'):
+            settings['drop_threshold'] = self.thresh_spin.value()
+
+        # Sentence Clustering settings
+        if hasattr(self, 'sentence_thresh_spin'):
+            settings['sentence_threshold'] = self.sentence_thresh_spin.value()
+        if hasattr(self, 'levels_spin'):
+            settings['clustering_levels'] = self.levels_spin.value()
+        if hasattr(self, 'topk_clusters_spin'):
+            settings['top_k_clusters'] = self.topk_clusters_spin.value()
+
+        return settings
 
 class VectorStore:
     """Vector store for RAG (Retrieval-Augmented Generation)."""
@@ -51,10 +528,20 @@ class VectorStore:
         self.vectorizer = None
         self.pca = None
         self.is_initialized = False
+        self.chunk_project_map = {}
+        self.project_names = []
 
-    def build_index(self, chunks: List[str]):
+    def build_index(self, chunks: List[str], project_names: List[str] = None):
         print(f"📊 Building vector index with {len(chunks)} chunks...")
         self.chunks = chunks
+
+        if project_names:
+            self.chunk_project_map = {i: project_names[i] for i in range(len(chunks))}
+            self.project_names = list(set(project_names))
+        else:
+            self.chunk_project_map = {i: "Unknown" for i in range(len(chunks))}
+            self.project_names = ["Unknown"]
+
         print("   Creating TF-IDF vectors...")
         self.vectorizer = TfidfVectorizer(
             max_features=1000,
@@ -62,21 +549,56 @@ class VectorStore:
             ngram_range=(1, 2)
         )
         vectors = self.vectorizer.fit_transform(chunks)
+
         print("   Reducing dimensionality with PCA...")
-        self.pca = PCA(n_components=100)
-        self.embeddings = self.pca.fit_transform(vectors.toarray())
+        n_samples = vectors.shape[0]
+        n_features = vectors.shape[1]
+        max_components = min(n_samples, n_features, 100)
+
+        if max_components < 2:
+            print(f"   ⚠️ Too few samples ({n_samples}) for PCA, using raw TF-IDF")
+            self.embeddings = vectors.toarray()
+            self.pca = None
+        else:
+            self.pca = PCA(n_components=max_components)
+            self.embeddings = self.pca.fit_transform(vectors.toarray())
+            print(f"   Using {max_components} PCA components")
+
         self.is_initialized = True
         print(f"✅ Vector index built: {self.embeddings.shape[0]} chunks, {self.embeddings.shape[1]} dimensions")
         return self
 
-    def search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
+    def search_by_project(self, query: str, project_name: str, top_k: int = 10) -> List[Tuple[str, float, int]]:
         if not self.is_initialized or len(self.chunks) == 0:
             return []
+
+        project_indices = [i for i, p in self.chunk_project_map.items() if p == project_name]
+        if not project_indices:
+            return []
+
         query_vector = self.vectorizer.transform([query])
-        query_embedding = self.pca.transform(query_vector.toarray())
-        similarities = cosine_similarity(query_embedding, self.embeddings)[0]
-        top_indices = np.argsort(similarities)[::-1][:top_k]
-        return [(self.chunks[idx], similarities[idx]) for idx in top_indices]
+
+        if self.pca is not None:
+            query_embedding = self.pca.transform(query_vector.toarray())
+            chunk_embeddings = self.embeddings[project_indices]
+        else:
+            query_embedding = query_vector.toarray()
+            chunk_embeddings = self.vectorizer.transform([self.chunks[i] for i in project_indices]).toarray()
+
+        similarities = cosine_similarity(query_embedding, chunk_embeddings)[0]
+        sorted_indices = np.argsort(similarities)[::-1][:top_k]
+        results = []
+        for idx in sorted_indices:
+            actual_idx = project_indices[idx]
+            results.append((self.chunks[actual_idx], similarities[idx], actual_idx))
+        return results
+
+    def get_all_chunks_by_project(self, project_name: str) -> List[str]:
+        project_indices = [i for i, p in self.chunk_project_map.items() if p == project_name]
+        return [self.chunks[i] for i in project_indices]
+
+    def get_project_names(self) -> List[str]:
+        return self.project_names
 
     def save(self, filepath: str):
         data = {
@@ -84,7 +606,9 @@ class VectorStore:
             'embeddings': self.embeddings,
             'vectorizer': self.vectorizer,
             'pca': self.pca,
-            'is_initialized': self.is_initialized
+            'is_initialized': self.is_initialized,
+            'chunk_project_map': self.chunk_project_map,
+            'project_names': self.project_names
         }
         with open(filepath, 'wb') as f:
             pickle.dump(data, f)
@@ -98,227 +622,45 @@ class VectorStore:
         self.vectorizer = data['vectorizer']
         self.pca = data['pca']
         self.is_initialized = data['is_initialized']
+        self.chunk_project_map = data.get('chunk_project_map', {})
+        self.project_names = data.get('project_names', [])
         print(f"📂 Vector store loaded: {len(self.chunks)} chunks")
         return self
 
 
-class ProgressiveRAGEngine:
-    """Progressive RAG engine that processes chunks in batches."""
+class SemanticChunker:
+    """Chunk by semantic similarity - groups related sentences together."""
 
-    def __init__(self, vector_store: VectorStore, llm):
-        self.vector_store = vector_store
-        self.llm = llm
-        self.batch_size = 5
-        self.progress_callback = None
-
-    def query(self, query: str, top_k: int = 100) -> str:
-        print(f"🔍 Progressive RAG Query: {query}")
-        retrieved = self.vector_store.search(query, top_k=top_k)
-        print(f"   Retrieved {len(retrieved)} chunks")
-        if not retrieved:
-            return "No relevant information found in the data."
-        reranked = self._rerank_chunks(retrieved, query)
-        batch_responses = []
-        total_batches = (len(reranked) + self.batch_size - 1) // self.batch_size
-        for batch_num in range(total_batches):
-            start_idx = batch_num * self.batch_size
-            end_idx = min(start_idx + self.batch_size, len(reranked))
-            batch = reranked[start_idx:end_idx]
-            print(f"   Processing batch {batch_num + 1}/{total_batches} ({len(batch)} chunks)")
-            if self.progress_callback:
-                self.progress_callback(batch_num + 1, total_batches, len(batch))
-            brief_answer = self._process_batch(query, batch, batch_num + 1, total_batches)
-            if brief_answer:
-                batch_responses.append(brief_answer)
-        final_answer = self._synthesize_answers(query, batch_responses)
-        return final_answer
-
-    def _rerank_chunks(self, chunks: List[Tuple[str, float]], query: str) -> List[Tuple[str, float]]:
-        query_words = set(re.findall(r'\w+', query.lower()))
-        reranked = []
-        seen_keywords = set()
-        for chunk, score in chunks:
-            chunk_words = set(re.findall(r'\w+', chunk.lower()))
-            overlap = chunk_words.intersection(seen_keywords)
-            diversity_penalty = len(overlap) / max(len(chunk_words), 1) * 0.3
-            new_keywords = chunk_words - seen_keywords
-            diversity_boost = len(new_keywords) / max(len(query_words), 1) * 0.2
-            final_score = score + diversity_boost - diversity_penalty
-            reranked.append((chunk, final_score))
-            seen_keywords.update(chunk_words)
-        reranked.sort(key=lambda x: x[1], reverse=True)
-        return reranked
-
-    def _process_batch(self, query: str, batch: List[Tuple[str, float]], batch_num: int, total_batches: int) -> str:
-        context_parts = []
-        for chunk, score in batch:
-            chunk_text = chunk[:300] + "..." if len(chunk) > 300 else chunk
-            context_parts.append(f"[Score: {score:.2f}] {chunk_text}")
-        context = '\n\n'.join(context_parts)
-        prompt = f"""Based on these {len(batch)} text snippets, give a BRIEF answer (3-8 sentences) to the query.
-
-QUERY: {query}
-
-SNIPPETS:
-{context}
-
-BRIEF ANSWER:"""
-        try:
-            response = self.llm(prompt, max_tokens=60, temperature=0.6, top_p=0.9, stop=["###", "---", "```"])
-            content = response['choices'][0]['text'].strip()
-            if not content:
-                content = f"[Batch {batch_num}] No clear answer found."
-        except Exception as e:
-            print(f"   ⚠️ Batch {batch_num} error: {e}")
-            content = f"[Batch {batch_num}] Could not process this batch."
-        return content
-
-    def _synthesize_answers(self, query: str, batch_responses: List[str]) -> str:
-        if not batch_responses:
-            return "No answers could be generated from the data."
-        combined = '\n\n'.join([f"{i + 1}. {resp}" for i, resp in enumerate(batch_responses)])
-        prompt = f"""You are a research synthesizer. Combine these brief answers into a polished, comprehensive response.
-
-QUERY: {query}
-
-BRIEF ANSWERS FROM DIFFERENT DATA BATCHES:
-{combined}
-
-Create a well-structured final answer that:
-1. Starts with a clear summary
-2. Organizes the key points logically
-3. Provides specific details from the data
-4. Is comprehensive but concise
-
-FINAL ANSWER:"""
-        try:
-            response = self.llm(prompt, max_tokens=400, temperature=0.7, top_p=0.9, stop=["###", "---", "```"])
-            content = response['choices'][0]['text'].strip()
-            if not content:
-                content = "No final answer could be synthesized."
-        except Exception as e:
-            print(f"❌ Synthesis error: {e}")
-            content = f"Error synthesizing answers: {str(e)}"
-        content += f"\n\n---\n📚 Analyzed {len(batch_responses)} batches of data."
-        return content
-
-
-class ProgressiveRAGChatThread(QThread):
-    response_received = Signal(str)
-    error_occurred = Signal(str)
-    thinking_started = Signal()
-    thinking_finished = Signal()
-    progress_update = Signal(int, int, int)
-    status_update = Signal(str)
-    batch_complete = Signal(int, int)
-    all_complete = Signal()
-
-    def __init__(self, prompt: str, vector_store: VectorStore, model_path: str,
-                 top_k: int = 100, batch_size: int = 5, use_cache: bool = True):
-        super().__init__()
-        self.prompt = prompt
-        self.vector_store = vector_store
-        self.model_path = model_path
-        self.top_k = min(top_k, 200)
-        self.batch_size = batch_size
-        self.use_cache = use_cache
-        self.cache = {}
-        self.llm = None
-        self.is_running = True
-
-    def run(self):
-        try:
-            self.thinking_started.emit()
-            cache_key = self._get_cache_key()
-            if self.use_cache and cache_key in self.cache:
-                self.response_received.emit(self.cache[cache_key])
-                self.thinking_finished.emit()
-                return
-            self._get_llm()
-            self.status_update.emit("🔍 Retrieving relevant information...")
-            rag = ProgressiveRAGEngine(self.vector_store, self.llm)
-            rag.batch_size = self.batch_size
-            rag.progress_callback = self._on_progress
-            self.status_update.emit(f"📝 Processing {self.top_k} chunks in batches of {self.batch_size}...")
-            response = rag.query(self.prompt, top_k=self.top_k)
-            self.status_update.emit("✅ Complete!")
-            self.all_complete.emit()
-            if self.use_cache:
-                self.cache[cache_key] = response
-            self.response_received.emit(response)
-            self.thinking_finished.emit()
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.error_occurred.emit(str(e))
-            self.thinking_finished.emit()
-
-    def _on_progress(self, current_batch: int, total_batches: int, chunks_in_batch: int):
-        self.progress_update.emit(current_batch, total_batches, chunks_in_batch)
-        self.batch_complete.emit(current_batch, total_batches)
-
-    def _get_llm(self):
-        if self.llm is None:
-            print(f"Loading model from: {self.model_path}")
-            try:
-                self.llm = Llama(
-                    model_path=self.model_path,
-                    n_gpu_layers=0,
-                    n_ctx=2048,
-                    n_threads=4,
-                    verbose=False
-                )
-                print("✅ Model loaded successfully!")
-            except Exception as e:
-                print(f"❌ Model load failed: {e}")
-                self.llm = Llama(
-                    model_path=self.model_path,
-                    n_gpu_layers=-1,
-                    n_ctx=2048,
-                    verbose=False
-                )
-                print("✅ Model loaded with default settings!")
-        return self.llm
-
-    def _get_cache_key(self) -> str:
-        combined = f"{self.prompt}_{self.top_k}_{self.batch_size}"
-        return hashlib.md5(combined.encode()).hexdigest()
-
-    def stop(self):
-        self.is_running = False
-
-
-class SentenceChunker:
-    def __init__(self, min_sentences: int = 2, max_sentences: int = 5):
-        self.min_sentences = min_sentences
-        self.max_sentences = max_sentences
+    def __init__(self, similarity_threshold: float = 0.6):
+        self.threshold = similarity_threshold
+        self.vectorizer = TfidfVectorizer(max_features=100)
 
     def chunk_text(self, text: str) -> List[str]:
-        if not text or not text.strip():
-            return []
         sentences = self._split_sentences(text)
-        sentences = [s for s in sentences if len(s.split()) > 3]
-        if not sentences:
-            return []
-        chunks = []
-        i = 0
-        total = len(sentences)
-        while i < total:
-            remaining = total - i
-            if remaining <= self.max_sentences:
-                chunk_size = remaining
-            elif remaining <= self.max_sentences + 2:
-                chunk_size = remaining // 2
-            else:
-                chunk_size = min(self.max_sentences, max(self.min_sentences, remaining // 3))
-                chunk_size = max(self.min_sentences, min(self.max_sentences, chunk_size))
-            chunk_sentences = sentences[i:i + chunk_size]
-            chunk = ' '.join(chunk_sentences).strip()
-            if chunk and chunk[-1] not in '.!?':
-                chunk += '.'
-            chunks.append(chunk)
-            i += chunk_size
-        return chunks
+        if len(sentences) <= 1:
+            return sentences
+
+        try:
+            vectors = self.vectorizer.fit_transform(sentences)
+            similarities = cosine_similarity(vectors)
+
+            chunks = []
+            current_chunk = [sentences[0]]
+
+            for i in range(1, len(sentences)):
+                sim = similarities[i - 1][i]
+                if sim > self.threshold:
+                    current_chunk.append(sentences[i])
+                else:
+                    chunks.append(' '.join(current_chunk))
+                    current_chunk = [sentences[i]]
+
+            if current_chunk:
+                chunks.append(' '.join(current_chunk))
+
+            return chunks if chunks else [text]
+        except:
+            return self._fallback_chunking(sentences)
 
     def _split_sentences(self, text: str) -> List[str]:
         text = text.replace('\n', ' ').replace('\r', ' ')
@@ -335,37 +677,470 @@ class SentenceChunker:
                 cleaned.append(s)
         return cleaned
 
+    def _fallback_chunking(self, sentences: List[str]) -> List[str]:
+        chunks = []
+        current_chunk = []
+        current_length = 0
+
+        for sentence in sentences:
+            if current_length + len(sentence) > 800 and current_chunk:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = []
+                current_length = 0
+            current_chunk.append(sentence)
+            current_length += len(sentence)
+
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+
+        return chunks if chunks else [' '.join(sentences)]
+
+
+class WebExtractor:
+    """Extract clean text from HTML content."""
+
+    def __init__(self):
+        pass
+
+    def extract_content(self, html: str) -> str:
+        import re
+        from html import unescape
+
+        if not html:
+            return ""
+
+        html = re.sub(r'<script.*?>.*?</script>', '', html, flags=re.DOTALL)
+        html = re.sub(r'<style.*?>.*?</style>', '', html, flags=re.DOTALL)
+        html = re.sub(r'<nav.*?>.*?</nav>', '', html, flags=re.DOTALL)
+        html = re.sub(r'<header.*?>.*?</header>', '', html, flags=re.DOTALL)
+        html = re.sub(r'<footer.*?>.*?</footer>', '', html, flags=re.DOTALL)
+
+        content_patterns = [
+            r'<main.*?>(.*?)</main>',
+            r'<article.*?>(.*?)</article>',
+            r'<div[^>]*class="[^"]*content[^"]*".*?>(.*?)</div>',
+            r'<div[^>]*id="[^"]*content[^"]*".*?>(.*?)</div>',
+            r'<body.*?>(.*?)</body>'
+        ]
+
+        extracted_text = ""
+        for pattern in content_patterns:
+            match = re.search(pattern, html, re.DOTALL)
+            if match:
+                extracted_text = match.group(1)
+                break
+
+        if not extracted_text:
+            extracted_text = html
+
+        extracted_text = re.sub(r'<[^>]+>', ' ', extracted_text)
+        extracted_text = unescape(extracted_text)
+        extracted_text = re.sub(r'\s+', ' ', extracted_text)
+
+        return extracted_text.strip()
+
+    def clean_html(self, html: str) -> str:
+        import re
+        from html import unescape
+
+        html = re.sub(r'<script.*?>.*?</script>', '', html, flags=re.DOTALL)
+        html = re.sub(r'<style.*?>.*?</style>', '', html, flags=re.DOTALL)
+        html = re.sub(r'<[^>]+>', ' ', html)
+        html = unescape(html)
+        html = re.sub(r'\s+', ' ', html)
+        return html.strip()
+
+class SentenceClusterProcessor:
+    """
+    Sentence-level clustering: split into sentences, build clusters by relevance,
+    optionally further cluster, select top K by prompt relevance, distill insights,
+    and generate answer.
+    """
+    def __init__(self, query: str, chunks: List[str], project_names: List[str],
+                 llm, settings: dict, progress_callback=None):
+        self.query = query
+        self.chunks = chunks
+        self.project_names = project_names
+        self.llm = llm
+        self.settings = settings
+        self.progress_callback = progress_callback
+
+        self.temperature = settings.get('temperature', 0.7)
+        self.top_p = settings.get('top_p', 0.9)
+        self.batch_size = settings.get('batch_size', 5)
+        self.max_tokens = settings.get('max_tokens', 500)
+        self.threshold = settings.get('sentence_threshold', 0.5)
+        self.clustering_levels = settings.get('clustering_levels', 0)
+        self.top_k_clusters = settings.get('top_k_clusters', 5)
+
+        # Step 1: Extract all sentences
+        self.sentences = self._extract_sentences()
+
+        # Step 2: Build initial clusters
+        self.clusters = self._build_clusters()
+
+        # Step 3: Further clustering (if levels > 0)
+        if self.clustering_levels > 0:
+            for _ in range(self.clustering_levels):
+                self.clusters = self._further_cluster()
+
+        # Step 4: Select clusters by relevance to prompt
+        self.selected_clusters = self._select_clusters()
+
+        # Step 5: Distill insights from each cluster
+        self.distilled_insights = self._distill_clusters()
+
+        # Step 6: Build final context and answer
+        self.final_answer = self._generate_answer()
+
+    def _extract_sentences(self) -> List[str]:
+        """Combine all chunks and split into sentences."""
+        full_text = '\n\n'.join(self.chunks)
+        # Use a simple sentence splitter (could be improved)
+        sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', full_text)
+        # Clean up
+        sentences = [s.strip() for s in sentences if s.strip()]
+        return sentences
+
+    def _build_clusters(self) -> List[List[str]]:
+        """Cluster sentences by relevance to the cluster's anchor."""
+        if not self.sentences:
+            return []
+
+        # We'll use a TF-IDF vectorizer for relevance scoring
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        vectorizer = TfidfVectorizer(max_features=100, stop_words='english')
+        # Fit on all sentences once
+        sentence_vectors = vectorizer.fit_transform(self.sentences)
+
+        clusters = []
+        # Start with the first sentence as the anchor of the first cluster
+        current_cluster = [self.sentences[0]]
+        anchor_idx = 0  # index of the anchor sentence in the original list
+
+        for i in range(1, len(self.sentences)):
+            # Compute relevance scores
+            # 1. Relevance to last 2 sentences (heaviest)
+            if len(current_cluster) >= 2:
+                last_two = current_cluster[-2:]
+                sim_last2 = np.mean([cosine_similarity(sentence_vectors[i], sentence_vectors[self.sentences.index(s)])[0][0] for s in last_two])
+            else:
+                sim_last2 = cosine_similarity(sentence_vectors[i], sentence_vectors[self.sentences.index(current_cluster[-1])])[0][0]
+
+            # 2. Relevance to first 2 sentences (medium)
+            if len(current_cluster) >= 2:
+                first_two = current_cluster[:2]
+                sim_first2 = np.mean([cosine_similarity(sentence_vectors[i], sentence_vectors[self.sentences.index(s)])[0][0] for s in first_two])
+            else:
+                sim_first2 = sim_last2  # fallback
+
+            # 3. Relevance to entire cluster (lightest)
+            cluster_vectors = [sentence_vectors[self.sentences.index(s)] for s in current_cluster]
+            sim_cluster = np.mean([cosine_similarity(sentence_vectors[i], v)[0][0] for v in cluster_vectors])
+
+            # Weighted combined score
+            combined = 0.5 * sim_last2 + 0.3 * sim_first2 + 0.2 * sim_cluster
+
+            if combined < self.threshold:
+                # Start a new cluster
+                clusters.append(current_cluster)
+                current_cluster = [self.sentences[i]]
+            else:
+                current_cluster.append(self.sentences[i])
+
+        # Add the last cluster
+        if current_cluster:
+            clusters.append(current_cluster)
+
+        return clusters
+
+    def _further_cluster(self) -> List[List[str]]:
+        """
+        Combine the most similar clusters iteratively.
+        This reduces the number of clusters by pairing them.
+        """
+        if len(self.clusters) <= 1:
+            return self.clusters
+
+        # Vectorize clusters (average of sentence vectors)
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        # Flatten all sentences to build a consistent vectorizer
+        all_sentences = [s for cluster in self.clusters for s in cluster]
+        vectorizer = TfidfVectorizer(max_features=100, stop_words='english')
+        all_vectors = vectorizer.fit_transform(all_sentences)
+
+        # Compute cluster vectors (average of sentence vectors)
+        cluster_vectors = []
+        start = 0
+        for cluster in self.clusters:
+            end = start + len(cluster)
+            cluster_vec = np.mean(all_vectors[start:end], axis=0)
+            cluster_vectors.append(cluster_vec)
+            start = end
+
+        # Pair up most similar clusters
+        new_clusters = []
+        used = [False] * len(self.clusters)
+
+        for i in range(len(self.clusters)):
+            if used[i]:
+                continue
+            best_match = -1
+            best_score = -1
+            for j in range(i+1, len(self.clusters)):
+                if used[j]:
+                    continue
+                sim = cosine_similarity(cluster_vectors[i], cluster_vectors[j])[0][0]
+                if sim > best_score:
+                    best_score = sim
+                    best_match = j
+            if best_match != -1:
+                # Combine clusters i and best_match
+                combined = self.clusters[i] + self.clusters[best_match]
+                new_clusters.append(combined)
+                used[i] = True
+                used[best_match] = True
+            else:
+                # No match, keep cluster i as is
+                new_clusters.append(self.clusters[i])
+                used[i] = True
+
+        # Handle any remaining clusters (shouldn't happen but just in case)
+        for i, used_flag in enumerate(used):
+            if not used_flag:
+                new_clusters.append(self.clusters[i])
+
+        return new_clusters
+
+    def _select_clusters(self) -> List[List[str]]:
+        """Select top K clusters by relevance to the query."""
+        if not self.clusters:
+            return []
+
+        # Score each cluster by average relevance of its sentences to the query
+        scorer = MLRelevanceScorer(self.sentences, self.query)  # we can reuse
+        cluster_scores = []
+        for cluster in self.clusters:
+            # Average score of sentences in cluster
+            scores = [scorer.score_chunk(s) for s in cluster]
+            avg_score = sum(scores) / len(scores) if scores else 0
+            cluster_scores.append((cluster, avg_score))
+
+        # Sort by score descending (most relevant first)
+        cluster_scores.sort(key=lambda x: x[1], reverse=True)
+
+        # Take top K or all if fewer
+        selected = [cluster for cluster, _ in cluster_scores[:self.top_k_clusters]]
+        return selected
+
+    def _distill_clusters(self) -> List[str]:
+        """For each selected cluster, distill insights into a concise summary."""
+        distilled = []
+        for cluster in self.selected_clusters:
+            # Combine cluster text
+            cluster_text = ' '.join(cluster)
+            # If too long, chunk and distill incrementally
+            if self._count_tokens(cluster_text) > self.max_tokens:
+                # Chunk into sentences with token limit
+                chunks = self._chunk_text(cluster_text, self.max_tokens)
+                # Distill first chunk
+                summary = self._distill_chunk(chunks[0])
+                # Then merge subsequent chunks with unique info
+                for chunk in chunks[1:]:
+                    summary = self._merge_summaries(summary, self._distill_chunk(chunk))
+                distilled.append(summary)
+            else:
+                # Single distillation
+                summary = self._distill_chunk(cluster_text)
+                distilled.append(summary)
+        return distilled
+
+    def _chunk_text(self, text: str, max_tokens: int) -> List[str]:
+        """Split text into chunks respecting max tokens and sentence boundaries."""
+        sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        chunks = []
+        current_chunk = []
+        current_tokens = 0
+        for sent in sentences:
+            sent_tokens = self._count_tokens(sent)
+            if current_tokens + sent_tokens > max_tokens and current_chunk:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = []
+                current_tokens = 0
+            current_chunk.append(sent)
+            current_tokens += sent_tokens
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+        return chunks
+
+    def _count_tokens(self, text: str) -> int:
+        """Rough token count."""
+        return len(text) // 4
+
+    def _distill_chunk(self, text: str) -> str:
+        """Distill a single chunk into key insights."""
+        prompt = f"""Distill the key insights from the following text into a concise summary (3-5 sentences):
+
+{text}
+
+Summary:"""
+        return self._call_llm(prompt, max_tokens=100)
+
+    def _merge_summaries(self, summary_a: str, summary_b: str) -> str:
+        """Merge two summaries, adding only new info from summary_b."""
+        prompt = f"""Merge the following two summaries into one, keeping all information from the first and only adding new information from the second that is not already covered.
+
+Summary A:
+{summary_a}
+
+Summary B:
+{summary_b}
+
+Merged Summary:"""
+        return self._call_llm(prompt, max_tokens=150)
+
+    def _call_llm(self, prompt: str, max_tokens: int) -> str:
+        try:
+            response = self.llm(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                stop=["###", "---", "```"]
+            )
+            content = response['choices'][0]['text'].strip()
+            return content if content else ""
+        except Exception as e:
+            print(f"⚠️ LLM call error: {e}")
+            return ""
+
+    def _extract_claims(self, distilled_insights: List[str]) -> List[str]:
+        """Break down each distilled insight into individual claims (sentences)."""
+        claims = []
+        for insight in distilled_insights:
+            # Split by sentence boundaries
+            sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', insight)
+            claims.extend([s.strip() for s in sentences if s.strip()])
+        return claims
+
+    def _build_context(self, claims: List[str]) -> str:
+        """Select claims to fit within token limit, starting with the most relevant to the query."""
+        if not claims:
+            return ""
+
+        # Score each claim by relevance to query
+        scorer = MLRelevanceScorer(claims, self.query)
+        scored = [(claim, scorer.score_chunk(claim)) for claim in claims]
+        # Sort by score descending
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        # Take the most relevant as anchor
+        anchor = scored[0][0]
+        context_parts = [anchor]
+        used = {anchor}
+        total_tokens = self._count_tokens(anchor)
+
+        # Greedily add other claims by relevance to anchor (not to query)
+        # Re-score relevance to anchor
+        anchor_scorer = MLRelevanceScorer(claims, anchor)
+        remaining = [c for c, _ in scored[1:]]
+        # Sort by relevance to anchor
+        remaining.sort(key=lambda c: anchor_scorer.score_chunk(c), reverse=True)
+
+        for claim in remaining:
+            if claim in used:
+                continue
+            claim_tokens = self._count_tokens(claim)
+            if total_tokens + claim_tokens <= self.max_tokens:
+                context_parts.append(claim)
+                used.add(claim)
+                total_tokens += claim_tokens
+            else:
+                break
+
+        return '\n\n'.join(context_parts)
+
+    def _generate_answer(self) -> str:
+        """Generate final answer using the built context."""
+        if not self.distilled_insights:
+            return "No insights could be distilled."
+
+        # Extract claims
+        claims = self._extract_claims(self.distilled_insights)
+
+        if not claims:
+            return "No claims extracted."
+
+        # Build context
+        context = self._build_context(claims)
+
+        if not context:
+            return "No context could be built."
+
+        # Generate answer
+        prompt = f"""Answer the following query based solely on the provided context.
+
+QUERY: {self.query}
+
+CONTEXT:
+{context}
+
+ANSWER:"""
+        return self._call_llm(prompt, max_tokens=400)
+
 
 class DataProcessor:
-    def __init__(self, db, project_ids: List[int]):
+    """Process all selected projects' data into chunks with project tracking."""
+
+    def __init__(self, db, project_ids: List[int], mode: str = "Relevancy",
+                 max_tokens: int = 500, target_chunks: int = 10):
         self.db = db
         self.project_ids = project_ids
-        self.chunker = SentenceChunker(min_sentences=2, max_sentences=5)
+        self.extractor = WebExtractor()
+        self.chunk_project_names = []
+        self.mode = mode
+        self.max_tokens = max_tokens
+        self.target_chunks = target_chunks if target_chunks else 10  # Fallback
+        self.chunker = TokenAwareChunker(max_tokens_per_chunk=max_tokens)
 
     def process_all_data(self) -> List[str]:
-        print(f"📊 Processing {len(self.project_ids)} projects...")
-        all_text = []
+        print(f"📊 Processing {len(self.project_ids)} projects in {self.mode} mode...")
+        all_chunks = []
+        self.chunk_project_names = []
+
         for project_id in self.project_ids:
             project_data = self.db.get_project(project_id)
             if not project_data:
                 continue
+
             project_type = project_data.get('project_type', '')
             data_path = project_data.get('data_path', '')
             project_name = project_data.get('name', 'Unknown')
-            print(f"   📄 Processing: {project_name} ({project_type})")
+
+            print(f"\n   📖 Reading: {project_name} ({project_type})")
+            print(f"   {'=' * 40}")
+
             if project_type == 'data_table':
                 text = self._process_table(data_path)
-                if text:
-                    all_text.append(text)
+            elif project_type == 'data_chat':
+                text = self._process_chat_project(project_data)
             else:
                 text = self._process_research_pages(data_path)
-                if text:
-                    all_text.append(text)
-        combined = '\n\n'.join(all_text)
-        print(f"📝 Total text length: {len(combined)} characters")
-        chunks = self.chunker.chunk_text(combined)
-        print(f"📄 Created {len(chunks)} chunks")
-        return chunks
+
+            if text:
+                self.chunker.max_tokens = self.max_tokens
+                chunks = self.chunker.chunk_text(text, self.target_chunks if self.mode == "Sequential" else None)
+                print(f"   📄 Created {len(chunks)} chunks from {project_name}")
+
+                for chunk in chunks:
+                    all_chunks.append(chunk)
+                    self.chunk_project_names.append(project_name)
+            else:
+                print(f"   ⚠️ No content found in {project_name}")
+
+        print(f"\n📝 Total: {len(all_chunks)} chunks from {len(self.project_ids)} projects")
+        return all_chunks
 
     def _process_table(self, data_path: str) -> str:
         try:
@@ -387,23 +1162,633 @@ class DataProcessor:
             print(f"   ⚠️ Error processing table: {e}")
             return ""
 
+    def _process_chat_project(self, project_data: dict) -> str:
+        metadata = project_data.get('metadata', {})
+        sessions_data = metadata.get('chat_sessions', {})
+        messages_data = sessions_data.get('messages', {})
+
+        all_text = []
+        for session_id, messages in messages_data.items():
+            session_parts = []
+            for msg in messages:
+                role = msg.get('role', 'user')
+                content = msg.get('content', '')
+                if content:
+                    session_parts.append(f"[{role.upper()}]: {content}")
+            if session_parts:
+                all_text.append('\n'.join(session_parts))
+
+        return '\n\n--- SESSION BREAK ---\n\n'.join(all_text)
+
     def _process_research_pages(self, data_path: str) -> str:
         try:
             pages = self.db.get_research_pages(data_path)
             if not pages:
                 return ""
-            print(f"      📄 Found {len(pages)} pages")
+
+            print(f"      📄 Reading {len(pages)} pages...")
+
             all_text = []
-            for page in pages:
-                text = page.get('main_text', '') or page.get('raw_html', '')
+            for i, page in enumerate(pages):
+                if (i + 1) % 50 == 0:
+                    print(f"      📄 Progress: {i + 1}/{len(pages)} pages")
+
+                text = page.get('main_text', '')
+                if not text:
+                    raw_html = page.get('raw_html', '')
+                    if raw_html:
+                        try:
+                            text = self.extractor.extract_content(raw_html)
+                        except:
+                            text = self.extractor.clean_html(raw_html)
+
                 if text:
                     all_text.append(text)
+
             if not all_text:
                 return ""
+
             return '\n\n--- PAGE BREAK ---\n\n'.join(all_text)
         except Exception as e:
             print(f"   ⚠️ Error processing pages: {e}")
             return ""
+class ProgressiveRAGEngine:
+    def __init__(self, vector_store: VectorStore, llm,
+                 temperature: float = 0.7, top_p: float = 0.9,
+                 mode: str = "Relevancy", top_k: int = 20,
+                 process_all: bool = False, batch_size: int = 5,
+                 max_tokens: int = 500,
+                 sentence_threshold: float = 0.5,
+                 clustering_levels: int = 0,
+                 top_k_clusters: int = 5,
+                 progress_callback=None, batch_complete_callback=None):
+        self.vector_store = vector_store
+        self.llm = llm
+        self.temperature = temperature
+        self.top_p = top_p
+        self.mode = mode
+        self.top_k = top_k
+        self.process_all = process_all
+        self.batch_size = batch_size
+        self.max_tokens = max_tokens
+        self.sentence_threshold = sentence_threshold
+        self.clustering_levels = clustering_levels
+        self.top_k_clusters = top_k_clusters
+        self.progress_callback = progress_callback
+        self.batch_complete_callback = batch_complete_callback
+        self.current_project = ""
+        # Default values for other modes
+        self.order = "Most Relevant First"
+        self.synthesis = "Contextual Linking"
+        self.cluster_count = 3
+        self.drop_threshold = 0.3
+
+    def log(self, text: str, prefix: str = "   "):
+        print(f"{prefix}{text}")
+
+    def query(self, query: str) -> str:
+        print("\n" + "=" * 60)
+        print(f"🔍 QUERY: {query}")
+        print(f"📋 MODE: {self.mode}")
+        print("=" * 60 + "\n")
+
+        project_names = self.vector_store.get_project_names()
+        if not project_names:
+            return "No projects available in the index."
+
+        print(f"📚 Found {len(project_names)} projects: {', '.join(project_names)}")
+
+        # Check if we're in Contextual mode - process all projects together
+        if self.mode == "Contextual":
+            all_chunks = []
+            all_project_names = []
+            for project in project_names:
+                chunks = self.vector_store.get_all_chunks_by_project(project)
+                if chunks:
+                    all_chunks.extend(chunks)
+                    all_project_names.extend([project] * len(chunks))
+
+            if not all_chunks:
+                return "No chunks found in any project."
+
+            print(f"📚 Processing {len(all_chunks)} chunks across {len(project_names)} projects")
+
+            # Get contextual settings
+            order = getattr(self, 'order', 'Most Relevant First')
+            synthesis = getattr(self, 'synthesis', 'Contextual Linking')
+            cluster_count = getattr(self, 'cluster_count', 3)
+            drop_threshold = getattr(self, 'drop_threshold', 0.3)
+
+            # Process with ContextualProcessor
+            processor = ContextualProcessor(
+                query, all_chunks, all_project_names, self.llm,
+                settings={
+                    'temperature': self.temperature,
+                    'top_p': self.top_p,
+                    'batch_size': self.batch_size,
+                    'max_tokens': self.max_tokens,
+                    'order': order,
+                    'synthesis': synthesis,
+                    'cluster_count': cluster_count,
+                    'drop_threshold': drop_threshold
+                },
+                progress_callback=self.progress_callback
+            )
+            return processor.final_answer
+
+        # Other modes (Relevancy, Sequential, Hierarchical) - process project by project
+        all_project_summaries = []
+        total_projects = len(project_names)
+
+        for idx, project_name in enumerate(project_names):
+            self.current_project = project_name
+            print(f"\n{'─' * 50}")
+            print(f"📖 PROJECT {idx + 1}/{total_projects}: {project_name}")
+            print(f"{'─' * 50}")
+
+            if self.mode == "Sentence Clustering":
+                all_chunks = []
+                all_project_names = []
+                for project in self.vector_store.get_project_names():
+                    chunks = self.vector_store.get_all_chunks_by_project(project)
+                    if chunks:
+                        all_chunks.extend(chunks)
+                        all_project_names.extend([project] * len(chunks))
+
+                if not all_chunks:
+                    return "No chunks found in any project."
+
+                processor = SentenceClusterProcessor(
+                    query, all_chunks, all_project_names, self.llm,
+                    settings={
+                        'temperature': self.temperature,
+                        'top_p': self.top_p,
+                        'batch_size': self.batch_size,
+                        'max_tokens': self.max_tokens,
+                        'sentence_threshold': getattr(self, 'sentence_threshold', 0.5),
+                        'clustering_levels': getattr(self, 'clustering_levels', 0),
+                        'top_k_clusters': getattr(self, 'top_k_clusters', 5)
+                    },
+                    progress_callback=self.progress_callback
+                )
+                return processor.final_answer
+
+            if self.mode == "Sequential":
+                chunks = self.vector_store.get_all_chunks_by_project(project_name)
+                print(f"   Processing all {len(chunks)} chunks sequentially")
+                if not chunks:
+                    print(f"   ⚠️ No chunks found in {project_name}")
+                    continue
+                project_summary = self._process_project_sequential(query, chunks, project_name)
+            else:  # Relevancy or Hierarchical
+                if self.process_all:
+                    all_chunks = self.vector_store.get_all_chunks_by_project(project_name)
+                    if not all_chunks:
+                        print(f"   ⚠️ No chunks found in {project_name}")
+                        continue
+                    scorer = MLRelevanceScorer(all_chunks, query)
+                    scored = [(chunk, scorer.score_chunk(chunk)) for chunk in all_chunks]
+                    scored.sort(key=lambda x: x[1], reverse=True)
+                    chunks = [chunk for chunk, _ in scored]
+                    print(f"   Processing all {len(chunks)} chunks sorted by relevance")
+                else:
+                    results = self.vector_store.search_by_project(query, project_name, self.top_k)
+                    chunks = [item[0] for item in results]
+                    print(f"   Found {len(chunks)} relevant chunks in {project_name}")
+                    if not chunks:
+                        print(f"   ⚠️ No relevant chunks found in {project_name}")
+                        continue
+
+                # Show top chunks
+                for i, chunk in enumerate(chunks[:3]):
+                    preview = chunk[:150] + "..." if len(chunk) > 150 else chunk
+                    print(f"   Chunk {i + 1}: {preview}")
+
+                project_summary = self._process_project_batches(query, chunks, project_name)
+
+            if project_summary:
+                all_project_summaries.append(project_summary)
+
+        if not all_project_summaries:
+            return "No relevant information found in any project."
+
+        print(f"\n{'=' * 60}")
+        print(f"🔄 FINAL SYNTHESIS")
+        print(f"{'=' * 60}\n")
+
+        if self.mode == "Hierarchical":
+            final_answer = self._hierarchical_synthesis(all_project_summaries, query)
+        else:
+            final_answer = self._direct_synthesis(query, all_project_summaries)
+
+        project_list = ', '.join(self.vector_store.get_project_names())
+        final_answer += f"\n\n---\n📚 Projects analyzed: {project_list}"
+        final_answer += f"\n📋 Mode: {self.mode}"
+        return final_answer
+
+    def _process_project_batches(self, query: str, chunks: List[str], project_name: str) -> str:
+        """Process chunks in batches and emit summaries."""
+        batch_responses = []
+        total_batches = (len(chunks) + self.batch_size - 1) // self.batch_size
+
+        for batch_num in range(total_batches):
+            start = batch_num * self.batch_size
+            end = min(start + self.batch_size, len(chunks))
+            batch = chunks[start:end]
+
+            print(f"\n   📦 Batch {batch_num + 1}/{total_batches} ({len(batch)} chunks)")
+
+            brief_answer = self._process_batch(query, batch, project_name, batch_num + 1)
+            if brief_answer:
+                batch_responses.append(brief_answer)
+                print(f"      ✅ Batch {batch_num + 1} processed")
+                if self.progress_callback:
+                    self.progress_callback('batch', batch_num + 1, total_batches, brief_answer, project_name)
+
+                # Emit batch_complete via progress callback or dedicated signal
+                if hasattr(self, 'batch_complete_callback') and self.batch_complete_callback:
+                    self.batch_complete_callback(batch_num + 1, total_batches)
+
+        if not batch_responses:
+            return ""
+
+        if self.mode == "Hierarchical":
+            project_summary = self._hierarchical_merge(batch_responses, query)
+        else:
+            project_summary = self._synthesize_project(query, batch_responses, project_name)
+
+        print(f"\n   📝 {project_name} summary generated")
+        print(f"      {project_summary[:200]}...")
+        if self.progress_callback:
+            self.progress_callback('project', 0, 0, project_summary, project_name)
+        return project_summary
+
+    def _process_batch(self, query: str, batch: List[str], project_name: str, batch_num: int) -> str:
+        context = '\n\n'.join([chunk[:300] + "..." if len(chunk) > 300 else chunk for chunk in batch])
+        prompt = f"""Based on the data provided, give a BRIEF answer (3-5 sentences) to the query.
+
+QUERY: {query}
+
+DATA (from {project_name}):
+{context}
+
+BRIEF ANSWER:"""
+        try:
+            max_tokens = max(40, min(100, len(batch) * 15))
+            response = self.llm(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                stop=["###", "---", "```"]
+            )
+            content = response['choices'][0]['text'].strip()
+            return content if content else f"[Batch {batch_num}] No clear answer found."
+        except Exception as e:
+            print(f"      ⚠️ Batch {batch_num} error: {e}")
+            return f"[Batch {batch_num}] Could not process this batch."
+
+    def _synthesize_project(self, query: str, batch_responses: List[str], project_name: str) -> str:
+        combined = '\n\n'.join([f"{i + 1}. {resp}" for i, resp in enumerate(batch_responses)])
+        prompt = f"""Summarize the insights from this project.
+
+QUERY: {query}
+
+PROJECT: {project_name}
+
+INSIGHTS FROM PROJECT:
+{combined}
+
+Create a brief summary (3-4 sentences) of what this project reveals about the query.
+Project Summary:"""
+        try:
+            response = self.llm(
+                prompt,
+                max_tokens=100,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                stop=["###", "---", "```"]
+            )
+            content = response['choices'][0]['text'].strip()
+            return f"📖 {project_name}: {content}" if content else ""
+        except:
+            return f"📖 {project_name}: Insights could not be synthesized."
+
+    def _hierarchical_merge(self, summaries: List[str], query: str) -> str:
+        if not summaries:
+            return ""
+        merged = summaries[0]
+        for i in range(1, len(summaries)):
+            merged = self._merge_two_summaries(merged, summaries[i], query)
+        return merged
+
+    def _merge_two_summaries(self, summary_a: str, summary_b: str, query: str) -> str:
+        prompt = f"""You are merging two summaries about the query: "{query}".
+
+Summary A (existing knowledge):
+{summary_a}
+
+Summary B (new information):
+{summary_b}
+
+Merge them into a single concise summary that captures ALL unique information from both.
+- Keep everything from Summary A.
+- Add any NEW information from Summary B that is not already covered in Summary A.
+- Avoid repetition.
+- Keep the merged summary concise and focused.
+
+Merged Summary:"""
+        try:
+            response = self.llm(
+                prompt,
+                max_tokens=200,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                stop=["###", "---", "```"]
+            )
+            content = response['choices'][0]['text'].strip()
+            return content if content else summary_a
+        except Exception as e:
+            print(f"⚠️ Merge error: {e}")
+            return summary_a
+
+    def _hierarchical_synthesis(self, summaries: List[str], query: str) -> str:
+        if not summaries:
+            return "No summaries to merge."
+        if len(summaries) == 1:
+            return summaries[0]
+        merged = summaries[0]
+        for i in range(1, len(summaries)):
+            merged = self._merge_two_summaries(merged, summaries[i], query)
+        return merged
+
+    def _direct_synthesis(self, query: str, project_summaries: List[str]) -> str:
+        combined = '\n\n'.join(project_summaries)
+        prompt = f"""Create a comprehensive final answer synthesizing insights from multiple projects.
+
+QUERY: {query}
+
+INSIGHTS FROM EACH PROJECT:
+{combined}
+
+Create a well-structured final answer that:
+1. Starts with a clear summary
+2. Organizes findings by project
+3. Highlights key patterns across projects
+4. Provides practical takeaways
+
+FINAL ANSWER:"""
+        try:
+            response = self.llm(
+                prompt,
+                max_tokens=600,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                stop=["###", "---", "```"]
+            )
+            content = response['choices'][0]['text'].strip()
+            return content if content else "No final answer could be synthesized."
+        except Exception as e:
+            print(f"❌ Synthesis error: {e}")
+            return f"Error synthesizing answers: {str(e)}"
+
+
+class TokenAwareChunker:
+    """
+    Intelligent chunker that respects token limits and sentence boundaries.
+    Each chunk starts and ends with complete sentences.
+    Overflow sentences are carried to the next chunk.
+    """
+
+    def __init__(self, max_tokens_per_chunk: int = 500):
+        self.max_tokens = max_tokens_per_chunk
+        self._token_cache = {}
+
+    def _count_tokens(self, text: str) -> int:
+        return len(text) // 4
+
+    def chunk_text(self, text: str, target_chunks: int = None) -> List[str]:
+        if not text or not text.strip():
+            return []
+
+        sentences = self._split_sentences(text)
+        if not sentences:
+            return []
+
+        sentences = [s for s in sentences if len(s.split()) > 3]
+        if not sentences:
+            return []
+
+        total_tokens = self._count_tokens(' '.join(sentences))
+        if target_chunks and target_chunks > 0:
+            target_tokens_per_chunk = max(100, total_tokens // target_chunks)
+            self.max_tokens = target_tokens_per_chunk
+
+        chunks = []
+        current_chunk = []
+        current_token_count = 0
+
+        for sentence in sentences:
+            sentence_tokens = self._count_tokens(sentence)
+            if sentence_tokens > self.max_tokens:
+                if current_chunk:
+                    chunks.append(' '.join(current_chunk))
+                    current_chunk = []
+                    current_token_count = 0
+                sub_sentences = self._split_long_sentence(sentence)
+                for sub in sub_sentences:
+                    if self._count_tokens(sub) <= self.max_tokens:
+                        chunks.append(sub)
+                    else:
+                        parts = self._split_by_punctuation(sub)
+                        for part in parts:
+                            if part:
+                                chunks.append(part)
+                continue
+
+            if current_token_count + sentence_tokens > self.max_tokens and current_chunk:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = []
+                current_token_count = 0
+
+            current_chunk.append(sentence)
+            current_token_count += sentence_tokens
+
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+
+        return [chunk.strip() for chunk in chunks if chunk.strip()]
+
+    def _split_sentences(self, text: str) -> List[str]:
+        text = text.replace('\n', ' ').replace('\r', ' ')
+        text = re.sub(r'\s+', ' ', text)
+        sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
+        if len(sentences) <= 1:
+            sentences = re.split(r'(?<=[.!?])\s+', text)
+        cleaned = []
+        for s in sentences:
+            s = s.strip()
+            if s:
+                if s[-1] not in '.!?':
+                    s += '.'
+                cleaned.append(s)
+        return cleaned
+
+    def _split_long_sentence(self, sentence: str) -> List[str]:
+        parts = re.split(r'(?<=[,;:])\s+|(?<=\s)(?:and|but|or|so|for|nor|yet)\s+', sentence)
+        if len(parts) <= 1 or any(len(p) > 100 for p in parts):
+            words = sentence.split()
+            part_size = max(10, len(words) // 5)
+            parts = [' '.join(words[i:i + part_size]) for i in range(0, len(words), part_size)]
+        result = []
+        for part in parts:
+            part = part.strip()
+            if part:
+                if part[-1] not in '.!?':
+                    part += '.'
+                result.append(part)
+        return result
+
+    def _split_by_punctuation(self, text: str) -> List[str]:
+        parts = re.split(r'(?<=[.!?,;:])\s+', text)
+        result = []
+        current = []
+        current_tokens = 0
+        for part in parts:
+            part_tokens = self._count_tokens(part)
+            if current_tokens + part_tokens > self.max_tokens and current:
+                result.append(' '.join(current))
+                current = []
+                current_tokens = 0
+            current.append(part)
+            current_tokens += part_tokens
+        if current:
+            result.append(' '.join(current))
+        return result
+
+
+class ProgressiveRAGChatThread(QThread):
+    response_received = Signal(str)
+    error_occurred = Signal(str)
+    thinking_started = Signal()
+    thinking_finished = Signal()
+    progress_update = Signal(int, int, int, str)
+    status_update = Signal(str)
+    batch_summary = Signal(str, str)  # (summary, project_name)
+    project_summary = Signal(str, str)  # (summary, project_name)
+    all_complete = Signal()
+    article_generated = Signal(str, int)  # (article, index)
+    cluster_formed = Signal(str, int)  # (cluster_summary, index)
+    final_answer_ready = Signal(str)  # final synthesis
+    batch_complete = Signal(int, int)  # ADD THIS - (current_batch, total_batches)
+
+    def __init__(self, prompt: str, vector_store: VectorStore, model_path: str,
+                 settings: dict, use_cache: bool = True):
+        super().__init__()
+        self.prompt = prompt
+        self.vector_store = vector_store
+        self.model_path = model_path
+        self.settings = settings
+        self.use_cache = use_cache
+        self.cache = {}
+        self.llm = None
+        self.is_running = True
+
+    def run(self):
+        try:
+            self.thinking_started.emit()
+            cache_key = self._get_cache_key()
+            if self.use_cache and cache_key in self.cache:
+                self.response_received.emit(self.cache[cache_key])
+                self.thinking_finished.emit()
+                return
+
+            self._get_llm()
+            self.status_update.emit("🔍 Retrieving relevant information...")
+
+            def progress_callback(typ, current, total, summary, project):
+                if typ == 'batch':
+                    self.batch_summary.emit(summary, project)
+                elif typ == 'project':
+                    self.project_summary.emit(summary, project)
+
+            def batch_complete_callback(current_batch, total_batches):
+                self.batch_complete.emit(current_batch, total_batches)
+
+            # Create the RAG engine with all settings
+            rag = ProgressiveRAGEngine(
+                self.vector_store, self.llm,
+                temperature=self.settings.get('temperature', 0.7),
+                top_p=self.settings.get('top_p', 0.9),
+                mode=self.settings.get('mode', 'Relevancy'),
+                top_k=self.settings.get('top_k', 20),
+                process_all=self.settings.get('process_all', False),
+                batch_size=self.settings.get('batch_size', 5),
+                progress_callback=progress_callback,
+                batch_complete_callback=batch_complete_callback,  # PASS THIS
+                sentence_threshold = self.settings.get('sentence_threshold', 0.5),
+                clustering_levels = self.settings.get('clustering_levels', 0),
+                top_k_clusters = self.settings.get('top_k_clusters', 5)
+            )
+
+            # Pass contextual settings if available
+            if 'order' in self.settings:
+                rag.order = self.settings['order']
+            if 'synthesis' in self.settings:
+                rag.synthesis = self.settings['synthesis']
+            if 'cluster_count' in self.settings:
+                rag.cluster_count = self.settings['cluster_count']
+            if 'drop_threshold' in self.settings:
+                rag.drop_threshold = self.settings['drop_threshold']
+
+            self.status_update.emit(f"📝 Processing with {rag.mode} mode...")
+            response = rag.query(self.prompt)
+
+            self.status_update.emit("✅ Complete!")
+            self.all_complete.emit()
+            if self.use_cache:
+                self.cache[cache_key] = response
+            self.response_received.emit(response)
+            self.thinking_finished.emit()
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error_occurred.emit(str(e))
+            self.thinking_finished.emit()
+
+    def _on_progress(self, current_batch: int, total_batches: int, chunks_in_batch: int, project_name: str = ""):
+        self.progress_update.emit(current_batch, total_batches, chunks_in_batch, project_name)
+
+    def _get_llm(self):
+        if self.llm is None:
+            print(f"Loading model from: {self.model_path}")
+            try:
+                self.llm = Llama(
+                    model_path=self.model_path,
+                    n_gpu_layers=0,
+                    n_ctx=4096,
+                    n_threads=4,
+                    verbose=False
+                )
+                print("✅ Model loaded successfully!")
+            except Exception as e:
+                print(f"❌ Model load failed: {e}")
+                self.llm = Llama(
+                    model_path=self.model_path,
+                    n_gpu_layers=-1,
+                    n_ctx=4096,
+                    verbose=False
+                )
+                print("✅ Model loaded with default settings!")
+        return self.llm
+
+    def _get_cache_key(self) -> str:
+        combined = f"{self.prompt}_{self.settings}_{hashlib.md5(str(self.vector_store.chunks[:10]).encode()).hexdigest()}"
+        return hashlib.md5(combined.encode()).hexdigest()
+
+    def stop(self):
+        self.is_running = False
 
 
 class DataChatView(QWidget):
@@ -418,7 +1803,6 @@ class DataChatView(QWidget):
         self.project_name = project_data.get('name', 'Chat Project')
         self.data_path = project_data.get('data_path')
 
-        # Chat sessions
         self.chat_sessions = {}
         self.current_session_id = None
         self.chat_messages = {}
@@ -426,40 +1810,48 @@ class DataChatView(QWidget):
         self.next_session_id = 1
         self.vector_store_path = os.path.join(BASE_DIR, "vector_store.pkl")
 
-        # Cache
         self.response_cache = OrderedDict(maxsize=100)
 
-        # AI settings
         self.ai_enabled = False
         self.model_path = DEFAULT_MODEL_PATH
         self.model_loaded = False
         self.llm = None
 
-        # Selected projects
         self.selected_projects = []
-
-        # Vector store for RAG
         self.vector_store = VectorStore()
         self.is_vectorized = False
+        self.text_direction = Qt.LayoutDirection.LeftToRight
 
-        # Text direction
-        self.text_direction = Qt.LeftToRight
+        # Default settings
+        self.processing_settings = {
+            'mode': 'Relevancy',
+            'top_k': 20,
+            'batch_size': 5,
+            'max_tokens': 500,
+            'target_chunks': 10,  # ADD THIS
+            'temperature': 0.7,
+            'top_p': 0.9,
+            'order': 'Most Relevant First',
+            'synthesis': 'Contextual Linking',
+            'cluster_count': 3,
+            'drop_threshold': 0.3,
+            'process_all': False
+        }
 
-        # Setup UI
         self.setup_ui()
         self.load_projects()
         self.load_chat_sessions()
         self.check_model_status()
         self.update_status("Ready")
+        pass
 
     def setup_ui(self):
-        """Setup the chat interface with progress bar at top."""
         layout = QVBoxLayout()
         layout.setAlignment(Qt.AlignTop)
         layout.setSpacing(2)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # === PROGRESS BAR ===
+        # Progress bar
         progress_container = QWidget()
         progress_container.setStyleSheet("background-color: #f0f0f0; border: none; padding: 0px; margin: 0px;")
         progress_container.setFixedHeight(22)
@@ -499,7 +1891,7 @@ class DataChatView(QWidget):
 
         layout.addWidget(progress_container)
 
-        # === TOP BAR ===
+        # Top bar
         top_bar = QHBoxLayout()
         top_bar.setSpacing(10)
         top_bar.setContentsMargins(5, 2, 5, 2)
@@ -524,28 +1916,44 @@ class DataChatView(QWidget):
         top_bar.addWidget(name_label)
         top_bar.addStretch()
 
-        # RAG Controls
-        controls_group = QGroupBox("RAG Controls")
+        # Controls
+
+        # Controls
+        controls_group = QGroupBox("Processing Controls")
         controls_group.setStyleSheet("QGroupBox { border: none; padding: 0px; margin: 0px; }")
         controls_layout = QHBoxLayout(controls_group)
         controls_layout.setSpacing(6)
         controls_layout.setContentsMargins(0, 0, 0, 0)
 
-        controls_layout.addWidget(QLabel("Top K:"))
-        self.top_k_spinner = QSpinBox()
-        self.top_k_spinner.setRange(20, 200)
-        self.top_k_spinner.setValue(100)
-        self.top_k_spinner.setFixedWidth(50)
-        self.top_k_spinner.setStyleSheet("font-size: 11px;")
-        controls_layout.addWidget(self.top_k_spinner)
+        # Mode selector - NOW WITH ALL 4 MODES
+        controls_layout.addWidget(QLabel("Mode:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems([
+            "Relevancy",
+            "Sequential",
+            "Hierarchical",
+            "Contextual",
+            "Sentence Clustering"  # NEW
+        ])
+        self.mode_combo.setStyleSheet("font-size: 11px; padding: 1px 4px;")
+        self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
+        controls_layout.addWidget(self.mode_combo)
 
-        controls_layout.addWidget(QLabel("Batch:"))
-        self.batch_size_spinner = QSpinBox()
-        self.batch_size_spinner.setRange(3, 15)
-        self.batch_size_spinner.setValue(5)
-        self.batch_size_spinner.setFixedWidth(40)
-        self.batch_size_spinner.setStyleSheet("font-size: 11px;")
-        controls_layout.addWidget(self.batch_size_spinner)
+        # Settings button
+        self.settings_btn = QPushButton("⚙️ Settings")
+        self.settings_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #607D8B;
+                color: white;
+                font-weight: bold;
+                padding: 3px 8px;
+                border-radius: 4px;
+                font-size: 10px;
+            }
+            QPushButton:hover { background-color: #455A64; }
+        """)
+        self.settings_btn.clicked.connect(self.show_settings)
+        controls_layout.addWidget(self.settings_btn)
 
         self.build_index_btn = QPushButton("📊 Build Index")
         self.build_index_btn.setStyleSheet("""
@@ -626,7 +2034,7 @@ class DataChatView(QWidget):
 
         layout.addLayout(top_bar)
 
-        # === MAIN SPLITTER ===
+        # Main splitter
         splitter = QSplitter(Qt.Horizontal)
         splitter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -639,8 +2047,20 @@ class DataChatView(QWidget):
 
         self.setLayout(layout)
 
+    def _on_mode_changed(self, mode: str):
+        """Update settings when mode changes."""
+        self.processing_settings['mode'] = mode
+        # Update the status bar to show current mode
+        self.update_status(f"📋 Mode: {mode}")
+
+    def show_settings(self):
+        """Show the settings dialog."""
+        dialog = SettingsDialog(self, self.processing_settings)
+        if dialog.exec_() == QDialog.DialogCode.Accepted:
+            self.processing_settings = dialog.get_settings()
+            self.update_status(f"⚙️ Settings updated: {self.processing_settings['mode']}")
+
     def create_left_panel(self):
-        """Create the left panel with sessions and project selector."""
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -670,7 +2090,6 @@ class DataChatView(QWidget):
         session_btns.addStretch()
         left_layout.addLayout(session_btns)
 
-        # Search within sessions (by content)
         session_search_label = QLabel("🔍 Search sessions:")
         session_search_label.setStyleSheet("font-size: 10px; color: #666; padding: 2px 4px;")
         left_layout.addWidget(session_search_label)
@@ -683,7 +2102,7 @@ class DataChatView(QWidget):
         left_layout.addWidget(self.session_search)
 
         # Projects
-        projects_label = QLabel("📊 Projects to Query")
+        projects_label = QLabel("📊 Sources to Query")
         projects_label.setStyleSheet(
             "font-weight: bold; padding: 4px 8px; background-color: #f0f0f0; font-size: 12px; margin-top: 4px;")
         left_layout.addWidget(projects_label)
@@ -694,7 +2113,7 @@ class DataChatView(QWidget):
         self.project_list.itemSelectionChanged.connect(self.update_selected_projects)
         left_layout.addWidget(self.project_list)
 
-        self.project_count_label = QLabel("Selected: 0 projects")
+        self.project_count_label = QLabel("Selected: 0 sources")
         self.project_count_label.setStyleSheet("color: #666; font-size: 10px; padding: 2px 4px;")
         left_layout.addWidget(self.project_count_label)
 
@@ -706,10 +2125,8 @@ class DataChatView(QWidget):
         return left_widget
 
     def _filter_sessions_by_content(self, text: str):
-        """Filter sessions by searching through their content."""
         text = text.lower().strip()
         if not text:
-            # Show all sessions
             for i in range(self.session_list.count()):
                 self.session_list.item(i).setHidden(False)
             return
@@ -718,19 +2135,15 @@ class DataChatView(QWidget):
             item = self.session_list.item(i)
             session_id = item.data(Qt.UserRole)
             messages = self.chat_messages.get(session_id, [])
-
-            # Search through all messages in this session
             found = False
             for msg in messages:
                 content = msg.get('content', '').lower()
                 if text in content:
                     found = True
                     break
-
             item.setHidden(not found)
 
     def _show_session_context_menu(self, position):
-        """Show context menu for session list."""
         menu = QMenu()
         rename_action = QAction("✏️ Rename Session", self)
         rename_action.triggered.connect(self._rename_selected_session)
@@ -738,7 +2151,6 @@ class DataChatView(QWidget):
         menu.exec_(self.session_list.mapToGlobal(position))
 
     def _rename_selected_session(self):
-        """Rename the selected session."""
         item = self.session_list.currentItem()
         if not item:
             return
@@ -754,7 +2166,6 @@ class DataChatView(QWidget):
             self.update_session_list()
 
     def create_right_panel(self):
-        """Create the right panel."""
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -769,13 +2180,10 @@ class DataChatView(QWidget):
         chat_layout.setSpacing(4)
         chat_layout.setContentsMargins(4, 4, 4, 4)
 
-        # Chat display
         self.chat_display = QTextEdit()
         self.chat_display.setReadOnly(True)
         self.chat_display.setAcceptRichText(True)
-        # Set initial direction
-        self.chat_display.setLayoutDirection(Qt.LeftToRight)
-        # Use a text option to ensure proper alignment
+        self.chat_display.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
         self.chat_display.setAlignment(Qt.AlignLeft)
         self.chat_display.setStyleSheet("""
             QTextEdit {
@@ -831,7 +2239,6 @@ class DataChatView(QWidget):
         toolbar.setSpacing(6)
         toolbar.setContentsMargins(4, 2, 4, 2)
 
-        # Search within current session
         self.chat_search = QLineEdit()
         self.chat_search.setPlaceholderText("🔍 Search in chat...")
         self.chat_search.setStyleSheet("font-size: 11px; padding: 2px 6px; border: 1px solid #ddd; border-radius: 3px;")
@@ -840,7 +2247,6 @@ class DataChatView(QWidget):
 
         toolbar.addStretch()
 
-        # Font family
         toolbar.addWidget(QLabel("Font:"))
         self.font_combo = QComboBox()
         self.font_combo.addItems(["Segoe UI", "Arial", "Times New Roman", "Courier New", "Georgia", "Verdana"])
@@ -848,7 +2254,6 @@ class DataChatView(QWidget):
         self.font_combo.currentTextChanged.connect(self._update_chat_style)
         toolbar.addWidget(self.font_combo)
 
-        # Font size
         toolbar.addWidget(QLabel("Size:"))
         self.font_size_spinner = QSpinBox()
         self.font_size_spinner.setRange(8, 24)
@@ -858,7 +2263,6 @@ class DataChatView(QWidget):
         self.font_size_spinner.valueChanged.connect(self._update_chat_style)
         toolbar.addWidget(self.font_size_spinner)
 
-        # Line height
         toolbar.addWidget(QLabel("Line Ht:"))
         self.line_height_spinner = QDoubleSpinBox()
         self.line_height_spinner.setRange(1.0, 3.0)
@@ -869,7 +2273,6 @@ class DataChatView(QWidget):
         self.line_height_spinner.valueChanged.connect(self._update_chat_style)
         toolbar.addWidget(self.line_height_spinner)
 
-        # Text direction toggle
         self.direction_btn = QPushButton("⇄ LTR")
         self.direction_btn.setFixedWidth(60)
         self.direction_btn.setStyleSheet("""
@@ -910,9 +2313,8 @@ class DataChatView(QWidget):
         return right_widget
 
     def _toggle_text_direction(self):
-        """Toggle text direction between LTR and RTL."""
-        if self.text_direction == Qt.LeftToRight:
-            self.text_direction = Qt.RightToLeft
+        if self.text_direction == Qt.LayoutDirection.LeftToRight:
+            self.text_direction = Qt.LayoutDirection.RightToLeft
             self.direction_btn.setText("⇄ RTL")
             self.direction_btn.setStyleSheet("""
                 QPushButton {
@@ -926,7 +2328,7 @@ class DataChatView(QWidget):
                 QPushButton:hover { background-color: #1976D2; }
             """)
         else:
-            self.text_direction = Qt.LeftToRight
+            self.text_direction = Qt.LayoutDirection.LeftToRight
             self.direction_btn.setText("⇄ LTR")
             self.direction_btn.setStyleSheet("""
                 QPushButton {
@@ -940,63 +2342,50 @@ class DataChatView(QWidget):
                 QPushButton:hover { background-color: #d0d0d0; }
             """)
 
-        # Update both the chat display and input field
         self.chat_display.setLayoutDirection(self.text_direction)
-        self.chat_display.setAlignment(Qt.AlignLeft if self.text_direction == Qt.LeftToRight else Qt.AlignRight)
+        self.chat_display.setAlignment(
+            Qt.AlignLeft if self.text_direction == Qt.LayoutDirection.LeftToRight else Qt.AlignRight)
         self.chat_input.setLayoutDirection(self.text_direction)
-        self.chat_input.setAlignment(Qt.AlignLeft if self.text_direction == Qt.LeftToRight else Qt.AlignRight)
+        self.chat_input.setAlignment(
+            Qt.AlignLeft if self.text_direction == Qt.LayoutDirection.LeftToRight else Qt.AlignRight)
 
     def _search_chat(self):
-        """Search within the current chat display."""
         text = self.chat_search.text().strip()
         if not text:
-            # Reset selection
             cursor = self.chat_display.textCursor()
             cursor.clearSelection()
             self.chat_display.setTextCursor(cursor)
             return
 
-        # Create a format for highlighting
         highlight_format = QTextCharFormat()
-        highlight_format.setBackground(QColor(255, 255, 0))  # Yellow highlight
-        highlight_format.setForeground(QColor(0, 0, 0))  # Black text
+        highlight_format.setBackground(QColor(255, 255, 0))
+        highlight_format.setForeground(QColor(0, 0, 0))
 
-        # Search from current position
         cursor = self.chat_display.textCursor()
         if not cursor.hasSelection():
             cursor.movePosition(QTextCursor.Start)
-
-        # Clear existing selection
         cursor.clearSelection()
 
-        # Search for the text
         found = self.chat_display.find(text)
         if not found:
-            # Wrap around
             cursor.movePosition(QTextCursor.Start)
             self.chat_display.setTextCursor(cursor)
             found = self.chat_display.find(text)
 
         if found:
-            # Apply highlighting to the found text
             cursor = self.chat_display.textCursor()
             cursor.mergeCharFormat(highlight_format)
             self.chat_display.setTextCursor(cursor)
 
     def _update_chat_style(self):
-        """Update chat display styling with actual font changes."""
         font_family = self.font_combo.currentText()
         font_size = self.font_size_spinner.value()
         line_height = self.line_height_spinner.value()
 
-        # Apply font directly to the widget
         font = QFont(font_family, font_size)
         self.chat_display.setFont(font)
-
-        # Also set the font for the input field
         self.chat_input.setFont(font)
 
-        # Set line height using style sheet
         self.chat_display.setStyleSheet(f"""
             QTextEdit {{
                 background-color: #fcfcfc;
@@ -1010,21 +2399,37 @@ class DataChatView(QWidget):
         """)
 
     def load_projects(self):
-        """Load projects for selection."""
         self.project_list.clear()
         all_projects = self.db.get_all_projects()
+
         for project in all_projects:
             if project['id'] == self.project_id:
                 continue
-            icon = {
-                'data_table': '📊',
-                'data_research': '🌐',
-                'data_document': '📄'
-            }.get(project['project_type'], '📁')
-            display = f"{icon} {project['name']}"
+
+            project_type = project.get('project_type', '')
+            project_name = project.get('name', 'Unknown')
+
+            if project_type == 'data_chat':
+                icon = '💬'
+                label = 'Chat'
+            elif project_type == 'data_table':
+                icon = '📊'
+                label = 'Table'
+            elif project_type == 'data_research':
+                icon = '🌐'
+                label = 'Research'
+            elif project_type == 'data_document':
+                icon = '📄'
+                label = 'Document'
+            else:
+                icon = '📁'
+                label = project_type.replace('_', ' ').title()
+
+            display = f"{icon} {project_name} ({label})"
             item = QListWidgetItem(display)
             item.setData(Qt.UserRole, project['id'])
             self.project_list.addItem(item)
+
         self.update_project_count()
 
     def update_selected_projects(self):
@@ -1036,29 +2441,44 @@ class DataChatView(QWidget):
 
     def update_project_count(self):
         count = len(self.selected_projects)
-        self.project_count_label.setText(f"Selected: {count} projects")
+        self.project_count_label.setText(f"Selected: {count} sources")
 
     def build_vector_index(self):
         if not self.selected_projects:
-            QMessageBox.warning(self, "No Projects", "Please select projects first.")
+            QMessageBox.warning(self, "No Sources", "Please select sources first.")
             return
+
+        print("\n" + "=" * 60)
+        print("📊 BUILDING VECTOR INDEX")
+        print(f"📋 Mode: {self.processing_settings.get('mode', 'Relevancy')}")
+        print("=" * 60 + "\n")
 
         self.update_status("⏳ Building vector index...")
         self.index_status_label.setText("⏳ Building index...")
         self.progress_bar.setValue(10)
         self.progress_label.setText("Processing data...")
 
-        processor = DataProcessor(self.db, self.selected_projects)
+        # Get settings with fallbacks
+        mode = self.processing_settings.get('mode', 'Relevancy')
+        max_tokens = self.processing_settings.get('max_tokens', 500)
+        target_chunks = self.processing_settings.get('target_chunks', 10)  # Fallback to 10
+
+        processor = DataProcessor(
+            self.db, self.selected_projects,
+            mode=mode,
+            max_tokens=max_tokens,
+            target_chunks=target_chunks
+        )
         chunks = processor.process_all_data()
 
         if not chunks:
-            QMessageBox.warning(self, "No Data", "No data found in selected projects.")
+            QMessageBox.warning(self, "No Data", "No data found in selected sources.")
             return
 
         self.progress_bar.setValue(40)
         self.progress_label.setText("Building vector index...")
 
-        self.vector_store.build_index(chunks)
+        self.vector_store.build_index(chunks, processor.chunk_project_names)
         self.is_vectorized = True
 
         try:
@@ -1071,6 +2491,10 @@ class DataChatView(QWidget):
         self.progress_label.setText("✅ Index ready!")
         QTimer.singleShot(1000, lambda: self.progress_bar.setValue(0))
         QTimer.singleShot(1000, lambda: self.progress_label.setText("Ready"))
+
+        print("\n✅ INDEX BUILD COMPLETE")
+        print(f"   {len(chunks)} chunks indexed from {len(self.selected_projects)} projects")
+        print(f"   Projects: {', '.join(self.vector_store.get_project_names())}")
 
         self.update_status(f"✅ Vector index built with {len(chunks)} chunks")
 
@@ -1087,7 +2511,7 @@ class DataChatView(QWidget):
             return
 
         if not self.selected_projects:
-            QMessageBox.warning(self, "No Projects", "Please select projects first.")
+            QMessageBox.warning(self, "No Sources", "Please select sources first.")
             return
 
         if not self.is_vectorized:
@@ -1110,44 +2534,117 @@ class DataChatView(QWidget):
         self.chat_input.clear()
         self.chat_input.setEnabled(False)
 
-        top_k = self.top_k_spinner.value()
-        batch_size = self.batch_size_spinner.value()
+        print("\n" + "=" * 60)
+        print(f"🔍 QUERY: {prompt}")
+        print(f"📋 Mode: {self.processing_settings.get('mode', 'Relevancy')}")
+        print("=" * 60 + "\n")
 
         self.progress_bar.setValue(0)
         self.progress_label.setText("🔍 Starting...")
 
         self._create_response_placeholder()
 
+        # Get all settings with defaults
+        settings = {
+            'mode': self.processing_settings.get('mode', 'Relevancy'),
+            'top_k': self.processing_settings.get('top_k', 20),
+            'process_all': self.processing_settings.get('process_all', False),
+            'batch_size': self.processing_settings.get('batch_size', 5),
+            'max_tokens': self.processing_settings.get('max_tokens', 500),
+            'target_chunks': self.processing_settings.get('target_chunks', 10),
+            'temperature': 0.7,
+            'top_p': 0.9,
+            'order': self.processing_settings.get('order', 'Most Relevant First'),
+            'synthesis': self.processing_settings.get('synthesis', 'Contextual Linking'),
+            'cluster_count': self.processing_settings.get('cluster_count', 3),
+            'drop_threshold': self.processing_settings.get('drop_threshold', 0.3)
+        }
+
+        # Create and start thread
         self.chat_thread = ProgressiveRAGChatThread(
             prompt, self.vector_store, self.model_path,
-            top_k=top_k,
-            batch_size=batch_size,
+            settings=settings,
             use_cache=True
         )
+
+        # Connect ALL signals (only the ones that exist)
         self.chat_thread.progress_update.connect(self.update_batch_progress)
-        self.chat_thread.batch_complete.connect(self.on_batch_complete)
+        self.chat_thread.batch_complete.connect(self.on_batch_complete)  # Now this exists
         self.chat_thread.all_complete.connect(self.on_all_complete)
         self.chat_thread.response_received.connect(self.on_response_received)
         self.chat_thread.error_occurred.connect(self.on_error_occurred)
         self.chat_thread.status_update.connect(self.update_status)
+        self.chat_thread.batch_summary.connect(self.append_batch_summary)
+        self.chat_thread.project_summary.connect(self.append_project_summary)
+
+        # Start the thread
         self.chat_thread.start()
 
-    def update_batch_progress(self, current_batch: int, total_batches: int, chunks_in_batch: int):
-        progress = int((current_batch / total_batches) * 100)
-        self.progress_bar.setValue(progress)
-        self.progress_label.setText(f"📦 Batch {current_batch}/{total_batches} ({chunks_in_batch} chunks)")
+    def update_batch_progress(self, current_batch: int, total_batches: int, chunks_in_batch: int,
+                              project_name: str = ""):
+        """Update the progress bar with batch information."""
+        if total_batches > 0:
+            progress = int((current_batch / total_batches) * 100)
+            self.progress_bar.setValue(progress)
+
+            if project_name:
+                self.progress_label.setText(
+                    f"📖 {project_name} | Batch {current_batch}/{total_batches} ({chunks_in_batch} chunks)")
+            else:
+                self.progress_label.setText(f"📦 Batch {current_batch}/{total_batches} ({chunks_in_batch} chunks)")
+        else:
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("Processing...")
+
+    def append_batch_summary(self, summary: str, project: str):
+        """Append a batch summary to the chat display."""
+        html = f"""
+        <div style="
+            background: #f0f8ff;
+            border-radius: 6px;
+            padding: 8px 12px;
+            margin: 4px 0;
+            border-left: 3px solid #2196F3;
+            font-size: 13px;
+            color: #2d3748;
+        ">
+            <div style="color: #666; font-size: 11px; font-weight: 600;">📦 Batch Summary - {project}</div>
+            <div style="margin-top: 4px;">{summary.replace(chr(10), '<br>')}</div>
+        </div>
+        """
+        self.chat_display.append(html)
+        self.chat_display.moveCursor(QTextCursor.End)
+        self.chat_display.repaint()
+
+
+    def append_project_summary(self, summary: str, project: str):
+        """Append a project summary to the chat display."""
+        html = f"""
+        <div style="
+            background: #e8f5e9;
+            border-radius: 6px;
+            padding: 10px 16px;
+            margin: 6px 0;
+            border-left: 4px solid #4CAF50;
+            font-size: 14px;
+            color: #1b5e20;
+        ">
+            <div style="color: #2e7d32; font-size: 12px; font-weight: 600;">📖 Project Summary - {project}</div>
+            <div style="margin-top: 4px;">{summary.replace(chr(10), '<br>')}</div>
+        </div>
+        """
+        self.chat_display.append(html)
+        self.chat_display.moveCursor(QTextCursor.End)
+        self.chat_display.repaint()
 
     def on_batch_complete(self, current_batch: int, total_batches: int):
         pass
 
     def _create_response_placeholder(self):
-        """Create a placeholder that gets rendered properly."""
+        """Create a placeholder for the response."""
         timestamp = datetime.now().strftime("%H:%M")
+        placeholder = "🔄 Processing projects..."
 
-        # Create the placeholder text without HTML wrapper issues
-        placeholder = "🔄 Processing batches of data..."
-
-        # Use a simpler HTML structure that renders properly
         html = f"""
         <div style="
             background: #f8f9fa;
@@ -1172,20 +2669,21 @@ class DataChatView(QWidget):
         self.chat_display.moveCursor(QTextCursor.End)
 
     def on_all_complete(self):
+        """Called when all processing is complete."""
         self.chat_input.setEnabled(True)
         self.update_status("Ready")
         self.progress_label.setText("✅ Done")
         QTimer.singleShot(1500, lambda: self.progress_bar.setValue(0))
         QTimer.singleShot(1500, lambda: self.progress_label.setText("Ready"))
 
-        # Auto-refresh the current session
         if self.current_session_id is not None:
             self.load_session_by_id(self.current_session_id)
 
+        print("\n✅ RESPONSE COMPLETE")
+        print("─" * 60)
+
     def on_response_received(self, response):
         """Handle the final response."""
-        # Format the response with double line breaks between paragraphs
-        # Split by single newlines and join with double
         paragraphs = response.split('\n')
         formatted_paragraphs = []
         for p in paragraphs:
@@ -1194,7 +2692,6 @@ class DataChatView(QWidget):
                 formatted_paragraphs.append(p)
         formatted_text = '<br><br>'.join(formatted_paragraphs)
 
-        # Build the styled response
         styled = f"""
         <div style="
             background: #f8f9fa;
@@ -1214,31 +2711,25 @@ class DataChatView(QWidget):
         </div>
         """
 
-        # Find and replace the placeholder
         html = self.chat_display.toHtml()
-
-        # Find the last AI message and replace it
         import re
-        # Look for the pattern with the placeholder
         pattern = r'<div style="background: #f8f9fa; border-radius: 8px; padding: 16px 20px; margin: 4px 0; border-left: 4px solid #9C27B0;.*?</div>'
         match = re.search(pattern, html, re.DOTALL)
 
         if match:
-            # Replace the placeholder with the actual response
             new_html = html.replace(match.group(0), styled)
             self.chat_display.setHtml(new_html)
             self.chat_display.moveCursor(QTextCursor.End)
         else:
-            # Fallback: just append
             self.chat_display.append(f"🤖 **AI:** {styled}")
             self.chat_display.append("")
             self.chat_display.moveCursor(QTextCursor.End)
 
-        # Store in chat history
         timestamp = datetime.now().strftime("%H:%M")
         self.add_message_to_chat('assistant', response, timestamp)
 
     def on_error_occurred(self, error):
+        """Handle errors."""
         self.update_status(f"❌ Error: {error}")
         self.chat_input.setEnabled(True)
         self.progress_label.setText("❌ Error")
@@ -1259,6 +2750,8 @@ class DataChatView(QWidget):
                 border-radius: 3px;
             }
         """))
+
+        print(f"\n❌ ERROR: {error}")
 
     def load_chat_sessions(self):
         project_data = self.db.get_project(self.project_id)
@@ -1301,7 +2794,6 @@ class DataChatView(QWidget):
         session_id = int(self.next_session_id)
         self.next_session_id += 1
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        # Use a generic name without emoji prefix
         name = f"Session {session_id}"
 
         self.chat_sessions[session_id] = {
@@ -1336,7 +2828,6 @@ class DataChatView(QWidget):
         for session_id in sorted_ids:
             name = self.session_names.get(session_id, f"Session {session_id}")
             count = self.chat_sessions[session_id].get('message_count', 0)
-            # Remove emoji from name if it starts with one
             clean_name = name
             if clean_name.startswith('💬'):
                 clean_name = clean_name[2:].strip()
@@ -1355,7 +2846,6 @@ class DataChatView(QWidget):
             self.session_list.addItem(item)
 
     def delete_selected_sessions(self):
-        """Delete multiple selected sessions."""
         selected_items = self.session_list.selectedItems()
         if not selected_items:
             return
@@ -1414,7 +2904,7 @@ class DataChatView(QWidget):
                 color: #2d3748;
             ">
                 <b>💬 Welcome to your chat session!</b><br><br>
-                Select projects, build index, then enable AI to start asking questions.
+                Select sources, build index, then enable AI to start asking questions.
             </div>
             """
             self.chat_display.append(welcome)
@@ -1431,7 +2921,6 @@ class DataChatView(QWidget):
                     badge = "📝 Answer"
                     color = "#4CAF50"
 
-                # Replace newlines with double <br> for proper paragraph separation
                 paragraphs = content.split('\n')
                 formatted_content = '<br><br>'.join([p for p in paragraphs if p.strip()])
 
@@ -1453,7 +2942,7 @@ class DataChatView(QWidget):
                 </div>
                 """
                 if timestamp:
-                    html += f"<div style='color: #999; font-size: 11px; text-align: right; margin-top: 2px;'>{timestamp}</div>"
+                    html += f"<div style='color: #999; font-size: 11px; text-align: left; margin-top: 2px;'>{timestamp}</div>"
                 self.chat_display.append(html)
         self.chat_display.moveCursor(QTextCursor.End)
         self.update_session_list()
@@ -1500,7 +2989,6 @@ class DataChatView(QWidget):
             'timestamp': timestamp
         })
 
-        # Auto-rename session if it's the first message (without emoji prefix)
         if len(self.chat_messages[self.current_session_id]) == 1:
             prompt_preview = content[:30] + ("..." if len(content) > 30 else "")
             self.session_names[self.current_session_id] = prompt_preview
