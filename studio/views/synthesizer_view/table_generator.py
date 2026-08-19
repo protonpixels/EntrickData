@@ -8,6 +8,8 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+from core.extraction_pipeline import ExtractionPipeline
+
 
 class ResponseType(Enum):
     SENTENCE = "sentence"
@@ -46,6 +48,17 @@ class ColumnDefinition:
     response_size: Dict[str, Any] = field(default_factory=lambda: {
         'words': (2, 6)
     })
+    # --- New fields for Gradual Extraction ---
+    seed_pattern: Optional[str] = None  # e.g., r"PROVEN HEADLINE:\s*\"([^\"]+)\""
+    ml_model_id: Optional[int] = None
+    extraction_stage: str = "seed"  # "seed", "ml_scan", "ai_enrich"
+    confidence_threshold: float = 0.85
+    use_ml_assist: bool = False
+    handcrafted_features: bool = True
+    extracted_seed_items: List[str] = field(default_factory=list)  # Cache for UI
+    ml_training_status: str = "not_trained"  # "not_trained", "training", "trained", "error"
+    ml_accuracy: float = 0.0
+    candidate_results: List[Dict] = field(default_factory=list)  # For preview
 
 
 class ChunkExtractor:
@@ -329,11 +342,11 @@ RESPONSE:"""
             return {'item': f"[Error: {str(e)}]", 'chunks': chunks}
 
     def generate(self) -> List[List[Dict]]:
-        """Generate all columns in order with item progress tracking."""
+        """Generate all columns in order with gradual extraction support."""
         self.results = []
         self.processed_items = 0
 
-        # Count total items to process
+        # Count total items
         self.total_items = self._count_total_items()
 
         for col_idx, definition in enumerate(self.column_definitions):
@@ -350,25 +363,27 @@ RESPONSE:"""
                 self.results.append([])
                 continue
 
-            # Extract chunks
-            chunks = self._extract_chunks(definition, source_text)
+            # Check if this column has gradual extraction settings
+            if hasattr(definition, 'extraction_stage') and definition.extraction_stage:
+                column_items = self._generate_column_gradual(definition, source_text, col_idx)
+            else:
+                # Use existing generation logic
+                chunks = self._extract_chunks(definition, source_text)
+                if not chunks:
+                    self.results.append([])
+                    continue
 
-            if not chunks:
-                print(f"⚠️ No chunks extracted for column {definition.name}")
-                self.results.append([])
-                continue
+                # Generate items for each chunk
+                column_items = []
+                for chunk_idx, chunk in enumerate(chunks):
+                    item = self._generate_item(definition, [chunk])
+                    if item['item']:
+                        column_items.append(item)
 
-            # Generate items for each chunk with progress tracking
-            column_items = []
-            for chunk_idx, chunk in enumerate(chunks):
-                item = self._generate_item(definition, [chunk])
-                if item['item']:
-                    column_items.append(item)
-
-                # Track progress
-                self.processed_items += 1
-                if self.item_progress_callback:
-                    self.item_progress_callback(self.processed_items, self.total_items)
+                    # Track progress
+                    self.processed_items += 1
+                    if self.item_progress_callback:
+                        self.item_progress_callback(self.processed_items, self.total_items)
 
             self.results.append(column_items)
 
@@ -393,3 +408,77 @@ RESPONSE:"""
                 total += 5  # Default estimate
 
         return max(total, 1)  # At least 1 item
+
+    def _generate_column_gradual(self, definition: ColumnDefinition, source_text: str, col_idx: int) -> List[Dict]:
+        """Generate column using gradual extraction pipeline."""
+        pipeline = ExtractionPipeline(self.db, self.selected_projects[0] if self.selected_projects else None,
+                                      definition.name)
+
+        # Stage 1: Seed Extraction
+        if definition.extraction_stage == "seed" and definition.seed_pattern:
+            seeds = pipeline.extract_seed_items(source_text, definition.seed_pattern)
+            if seeds:
+                # Convert to standard format
+                return [{'item': seed, 'chunks': [seed], 'confidence': 1.0} for seed in seeds]
+
+        # Stage 2: ML Scan
+        if definition.use_ml_assist and definition.ml_model_id:
+            success = pipeline.load_ml_model(definition.ml_model_id)
+            if success:
+                candidates = pipeline.scan_with_ml(definition.confidence_threshold)
+                if candidates:
+                    return [{
+                        'item': c['text'],
+                        'chunks': [c['text']],
+                        'confidence': c['confidence']
+                    } for c in candidates]
+
+        # Stage 3: Fallback to AI generation
+        if definition.extraction_stage == "ai_enrich":
+            return self._generate_ai_items(definition, source_text)
+
+        # Fallback to regular generation
+        return self._generate_items_with_context(definition, source_text)
+
+    def _generate_ai_items(self, definition: ColumnDefinition, source_text: str) -> List[Dict]:
+        """Generate items using AI with full control."""
+        # Use existing extraction method with AI
+        chunks = self._extract_chunks(definition, source_text)
+        if not chunks:
+            return []
+
+        # Get AI settings from metadata
+        ai_settings = getattr(definition, 'ai_settings', {})
+        prompt_template = ai_settings.get('prompt', 'Summarize {{item}} in one sentence')
+        temperature = ai_settings.get('temperature', 0.7)
+        top_p = ai_settings.get('top_p', 0.9)
+        max_tokens = ai_settings.get('max_tokens', 200)
+
+        items = []
+        for chunk in chunks:
+            # Replace placeholders
+            prompt = prompt_template.replace('{{item}}', chunk)
+
+            try:
+                response = self.llm(
+                    prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop=["###", "---", "```"]
+                )
+                content = response['choices'][0]['text'].strip()
+                if content:
+                    items.append({
+                        'item': content,
+                        'chunks': [chunk],
+                        'context': chunk[:500] + '...' if len(chunk) > 500 else chunk
+                    })
+            except Exception as e:
+                print(f"⚠️ AI generation error: {e}")
+                items.append({
+                    'item': f"[Error: {str(e)}]",
+                    'chunks': [chunk]
+                })
+
+        return items

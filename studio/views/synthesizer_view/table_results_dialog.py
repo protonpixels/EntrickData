@@ -15,7 +15,9 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from views.regenerate_thread import RegenerateThread
+from views.synthesizer_view.regenerate_thread import RegenerateThread
+from views.synthesizer_view.table_setup_dialog import ColumnSetupDialog
+
 
 class FilterThread(QThread):
     """Thread for ML-based filtering."""
@@ -96,6 +98,13 @@ class TableResultsDialog(QDialog):
         # === Toolbar ===
         toolbar = QToolBar()
         toolbar.setStyleSheet("QToolBar { spacing: 4px; }")
+
+        # NEW: Back to Settings button
+        back_action = QAction("⚙️ Back to Settings", self)
+        back_action.triggered.connect(self.back_to_settings)
+        toolbar.addAction(back_action)
+
+        toolbar.addSeparator()
 
         # Filtering actions
         filter_action = QAction("🔍 ML Filter", self)
@@ -306,34 +315,64 @@ class TableResultsDialog(QDialog):
 
         self.status_label.setText(f"✅ ML filter applied: {len(good_indices)} good, {len(bad_indices)} bad")
 
-    def mark_selected_good(self):
-        """Mark selected rows as good examples."""
-        selected = self.table.selectedIndexes()
-        rows = set([idx.row() for idx in selected])
-
-        # Get items from the first column
-        for row in rows:
-            if row < len(self.results[0]):
-                item = self.results[0][row].get('item', '')
-                if item and item not in self.good_examples:
-                    self.good_examples.append(item)
-
-        self.status_label.setText(f"✅ Marked {len(rows)} rows as good (Total: {len(self.good_examples)})")
-
     def mark_selected_bad(self):
-        """Mark selected rows as bad examples."""
+        """Mark selected rows as bad examples for ML training."""
         selected = self.table.selectedIndexes()
         rows = set([idx.row() for idx in selected])
 
+        if not rows:
+            QMessageBox.information(self, "No Selection", "Please select rows to mark as bad.")
+            return
+
         # Get items from the first column
+        bad_count = 0
         for row in rows:
             if row < len(self.results[0]):
                 item = self.results[0][row].get('item', '')
                 if item and item not in self.bad_examples:
                     self.bad_examples.append(item)
+                    bad_count += 1
+                    # Highlight the row in red
+                    for col in range(self.table.columnCount()):
+                        table_item = self.table.item(row, col)
+                        if table_item:
+                            table_item.setBackground(QBrush(QColor(255, 200, 200)))  # Light red
 
-        self.status_label.setText(f"❌ Marked {len(rows)} rows as bad (Total: {len(self.bad_examples)})")
+        self.status_label.setText(f"❌ Marked {bad_count} rows as bad (Total: {len(self.bad_examples)})")
+        self.update_status()
 
+    def mark_selected_good(self):
+        """Mark selected rows as good examples for ML training."""
+        selected = self.table.selectedIndexes()
+        rows = set([idx.row() for idx in selected])
+
+        if not rows:
+            QMessageBox.information(self, "No Selection", "Please select rows to mark as good.")
+            return
+
+        # Get items from the first column
+        good_count = 0
+        for row in rows:
+            if row < len(self.results[0]):
+                item = self.results[0][row].get('item', '')
+                if item and item not in self.good_examples:
+                    self.good_examples.append(item)
+                    good_count += 1
+                    # Highlight the row in green
+                    for col in range(self.table.columnCount()):
+                        table_item = self.table.item(row, col)
+                        if table_item:
+                            table_item.setBackground(QBrush(QColor(200, 255, 200)))  # Light green
+
+        self.status_label.setText(f"✅ Marked {good_count} rows as good (Total: {len(self.good_examples)})")
+        self.update_status()
+
+    def update_status(self):
+        """Update the status bar with examples count."""
+        self.status_label.setText(
+            f"Good: {len(self.good_examples)} | Bad: {len(self.bad_examples)} | "
+            f"Selected: {len(self.table.selectedIndexes())} rows"
+        )
     def select_all(self):
         """Select all rows."""
         self.table.selectAll()
@@ -575,3 +614,31 @@ class TableResultsDialog(QDialog):
         self.results = results
         self.status_label.setText("✅ Regeneration complete")
         QMessageBox.information(self, "Complete", f"Successfully regenerated items.")
+
+    def back_to_settings(self):
+        """Go back to the settings dialog."""
+        reply = QMessageBox.question(
+            self,
+            "Back to Settings",
+            "Go back to column settings?\n\nAny unsaved changes will be lost.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            # Store the current columns and results
+            self.parent_app._pending_columns = self.columns
+            self.parent_app._pending_results = self.results
+
+            # Close this dialog
+            self.reject()
+
+            # Re-open the setup dialog with current settings
+            dialog = ColumnSetupDialog(self.parent_app)
+            dialog.columns = self.columns
+            dialog.update_column_list()
+            dialog.select_column(0)
+
+            if dialog.exec_() == QDialog.DialogCode.Accepted:
+                new_columns = dialog.get_columns()
+                # Re-generate with new settings
+                self.parent_app._generate_table(new_columns)

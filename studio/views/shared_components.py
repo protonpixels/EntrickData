@@ -416,6 +416,11 @@ class CreateProjectDialog(QDialog):
             return {
                 'chat_sessions': {}
             }
+        elif project_type == ProjectType.DATA_SYNTHESIZER.value:  # NEW
+            return {
+                'extraction_pipelines': [],
+                'source_history': []
+            }
         return {}
 
     def get_project_id(self) -> Optional[int]:

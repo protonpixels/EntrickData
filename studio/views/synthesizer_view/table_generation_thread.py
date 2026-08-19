@@ -1,6 +1,6 @@
 # studio/views/table_generation_thread.py
 from PySide6.QtCore import QThread, Signal
-from views.table_generator import TableGenerator
+from views.synthesizer_view.table_generator import TableGenerator
 
 
 class TableGenerationThread(QThread):

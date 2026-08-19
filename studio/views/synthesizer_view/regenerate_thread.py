@@ -1,6 +1,6 @@
 # studio/views/regenerate_thread.py
 from PySide6.QtCore import QThread, Signal
-from .table_generator import TableGenerator, ResponseType, ChunkStrategy, SourceType
+from views.synthesizer_view.table_generator import TableGenerator, ResponseType, ChunkStrategy, SourceType
 
 
 class RegenerateThread(QThread):

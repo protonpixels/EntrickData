@@ -19,6 +19,9 @@ studio/projects/data_tables/
 # Alternative: If you want to ignore all projects regardless of location
 **/projects/data_research/*
 **/projects/data_tables/*
+**/projects/data_document/*
+**/projects/data_synthesizer/*
+**/projects/data_chat/*
 **/projects/*.db
 studio/cache
 

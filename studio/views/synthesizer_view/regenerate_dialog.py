@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox, QCheckBox, QTabWidget, QWidget
 )
 from PySide6.QtCore import Qt, Signal
-from .table_generator import ResponseType
+from views.synthesizer_view.table_generator import ResponseType
 
 
 class RegenerateSettingsDialog(QDialog):

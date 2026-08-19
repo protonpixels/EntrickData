@@ -1,3 +1,5 @@
+# studio\core\database.py
+
 import sqlite3
 import json
 import os
@@ -11,6 +13,7 @@ class StudioDatabase:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._research_pages_cache = {}  # Add cache
         self._ensure_db_exists()
 
     def _ensure_db_exists(self):
@@ -687,8 +690,13 @@ class StudioDatabase:
 
     # ========== DATA RESEARCH METHODS ==========
 
+
     def get_research_pages(self, data_path: str) -> List[Dict]:
-        """Get all pages from a research project"""
+        """Get all pages from a research project with caching."""
+        # Check cache first
+        if data_path in self._research_pages_cache:
+            return self._research_pages_cache[data_path]
+
         if not os.path.exists(data_path):
             return []
 
@@ -703,10 +711,7 @@ class StudioDatabase:
             rows = cursor.fetchall()
             conn.close()
 
-            # Debug print
-            print(f"get_research_pages found {len(rows)} pages")
-
-            return [{
+            result = [{
                 'id': row[0],
                 'url': row[1],
                 'title': row[2] or '',
@@ -716,9 +721,17 @@ class StudioDatabase:
                 'raw_html': row[6] or '',
                 'fetched_at': row[7]
             } for row in rows]
+
+            # Cache the result
+            self._research_pages_cache[data_path] = result
+            return result
         except sqlite3.OperationalError:
             conn.close()
             return []
+
+    def clear_cache(self):
+        """Clear the research pages cache."""
+        self._research_pages_cache = {}
 
     def add_research_page(self, data_path: str, page_data: Dict) -> int:
         """Add a page to a research project"""
@@ -975,3 +988,102 @@ class StudioDatabase:
             conn.close()
             print(f"Error getting table data: {e}")
             return []
+
+    def get_project_text_pool(self, project_id: int) -> str:
+        """Get all text content from a project for ML training."""
+        project = self.get_project(project_id)
+        if not project:
+            return ""
+
+        project_type = project.get('project_type')
+        data_path = project.get('data_path')
+
+        if project_type == 'data_table':
+            rows = self.get_table_data(data_path)
+            text_parts = []
+            for row in rows:
+                text_parts.extend([str(cell) for cell in row if cell])
+            return '\n'.join(text_parts)
+
+        elif project_type in ['data_research', 'data_document']:
+            # Use the WebExtractor to clean the text properly
+            from studio.core.web_extractor import WebExtractor
+            extractor = WebExtractor()
+
+            pages = self.get_research_pages(data_path)
+            text_parts = []
+
+            for page in pages:
+                main_text = page.get('main_text', '')
+                raw_html = page.get('raw_html', '')
+
+                # If we have raw HTML, extract clean text from it
+                if raw_html:
+                    try:
+                        # Use the WebExtractor's clean method
+                        clean_text = extractor.clean_html(raw_html)
+                        if clean_text:
+                            text_parts.append(clean_text)
+                    except Exception as e:
+                        print(f"Error extracting text from page: {e}")
+                elif main_text:
+                    # Fallback to stored main_text
+                    text_parts.append(main_text)
+
+                # Also include title if available
+                title = page.get('title', '')
+                if title:
+                    text_parts.append(title)
+
+            return '\n\n'.join(text_parts)
+
+        elif project_type == 'data_chat':
+            import sqlite3
+            conn = sqlite3.connect(data_path)
+            cursor = conn.cursor()
+            try:
+                cursor.execute('SELECT content FROM chat_messages')
+                rows = cursor.fetchall()
+                conn.close()
+                return '\n'.join([row[0] for row in rows if row[0]])
+            except sqlite3.OperationalError:
+                conn.close()
+                return ""
+
+        return ""
+
+    def create_table_from_results(self, name: str, results: list, columns: list) -> int:
+        """Create a table project from results (without context)."""
+        # Build metadata - only column names, no context
+        metadata = {
+            'column_config': [
+                {'name': col.name, 'type': 'text', 'required': False}
+                for col in columns
+            ]
+        }
+
+        # Create project
+        project_id = self.create_project(
+            name=name,
+            project_type='data_table',
+            metadata=metadata
+        )
+
+        if not project_id:
+            return None
+
+        # Get data path
+        project_data = self.get_project(project_id)
+        data_path = project_data['data_path']
+
+        # Add rows - only the items, not context
+        for row_idx in range(len(results[0])):
+            row_data = []
+            for col_idx in range(len(columns)):
+                if col_idx < len(results) and row_idx < len(results[col_idx]):
+                    row_data.append(results[col_idx][row_idx].get('item', ''))
+                else:
+                    row_data.append('')
+            self.add_table_row(data_path, row_data)
+
+        return project_id

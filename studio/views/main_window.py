@@ -422,6 +422,7 @@ class MainWindow(QMainWindow):
 
     # ========== PROJECT OPERATIONS ==========
 
+    # Update the open_project method
     def open_project(self, project_id: int):
         """Open a project in a new tab"""
         project_data = self.db.get_project(project_id)
@@ -440,6 +441,7 @@ class MainWindow(QMainWindow):
         from views.data_research_view import DataResearchView
         from views.data_document_view import DataDocumentView
         from views.data_chat_view import DataChatView
+        from views.data_synthesizer_view import DataSynthesizerView  # NEW
 
         # Sync schema for data table projects
         if project_data['project_type'] == ProjectType.DATA_TABLE.value:
@@ -453,8 +455,13 @@ class MainWindow(QMainWindow):
             view = DataResearchView(self, self.db, project_data)
         elif project_data['project_type'] == ProjectType.DATA_DOCUMENT.value:
             view = DataDocumentView(self, self.db, project_data)
-        else:  # DATA_CHAT
+        elif project_data['project_type'] == ProjectType.DATA_CHAT.value:
             view = DataChatView(self, self.db, project_data)
+        elif project_data['project_type'] == ProjectType.DATA_SYNTHESIZER.value:  # NEW
+            view = DataSynthesizerView(self, self.db, project_data)
+        else:
+            QMessageBox.warning(self, "Error", f"Unknown project type: {project_data['project_type']}")
+            return
 
         # Add tab
         tab_name = project_data['name']

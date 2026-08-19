@@ -35,11 +35,11 @@ import pickle
 from llama_cpp import Llama
 
 
-from views.table_generator import TableGenerator, ColumnDefinition, ResponseType, ChunkStrategy, SourceType
-from views.table_setup_dialog import ColumnSetupDialog
+from views.synthesizer_view.table_generator import TableGenerator, ColumnDefinition, ResponseType, ChunkStrategy, SourceType
+from views.synthesizer_view.table_setup_dialog import ColumnSetupDialog
 # In data_chat_view.py, add import
-from views.table_results_dialog import TableResultsDialog
-from views.table_generation_thread import TableGenerationThread
+from views.synthesizer_view.table_results_dialog import TableResultsDialog
+from views.synthesizer_view.table_generation_thread import TableGenerationThread
 
 # Get the base directory path
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -3076,16 +3076,14 @@ class DataChatView(QWidget):
             QMessageBox.warning(self, "No Sources", "Please select sources first.")
             return
 
-        if not self.is_vectorized:
-            QMessageBox.warning(self, "No Index", "Please build the vector index first.")
-            return
-
         if not self.model_loaded:
             QMessageBox.warning(self, "Model Not Loaded", "Please load the model first.")
             return
 
-        # Show column setup dialog
-        dialog = ColumnSetupDialog(self)
+        # Show column setup dialog - pass self as parent with db access
+        dialog = ColumnSetupDialog(self)  # self has db, project_id, etc.
+        dialog.parent_app = self  # Give dialog access to parent
+
         if dialog.exec_() == QDialog.DialogCode.Accepted:
             columns = dialog.get_columns()
             if not columns:
