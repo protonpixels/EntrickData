@@ -1,14 +1,12 @@
+import csv
+import io
+import json
 import os
 import re
 import hashlib
-import json
-import pickle
 from datetime import datetime
 from collections import OrderedDict
 from typing import List, Dict, Tuple, Optional, Set
-
-import numpy as np
-
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QUrl
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -36,234 +34,18 @@ import pickle
 
 from llama_cpp import Llama
 
+
+from views.table_generator import TableGenerator, ColumnDefinition, ResponseType, ChunkStrategy, SourceType
+from views.table_setup_dialog import ColumnSetupDialog
+# In data_chat_view.py, add import
+from views.table_results_dialog import TableResultsDialog
+from views.table_generation_thread import TableGenerationThread
+
 # Get the base directory path
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DIR = os.path.join(BASE_DIR, "ai_model", "models")
 DEFAULT_MODEL_PATH = os.path.join(MODEL_DIR, "qwen2.5-1.5b-instruct.gguf")
 VECTOR_STORE_PATH = os.path.join(BASE_DIR, "vector_store.pkl")
-
-class ContextualProcessor:
-    """
-    Advanced processing pipeline: ordering, synthesis method, clustering,
-    article generation, and final synthesis.
-    """
-    def __init__(self, query: str, chunks: List[str], project_names: List[str],
-                 llm, settings: dict, progress_callback=None):
-        self.query = query
-        self.chunks = chunks
-        self.project_names = project_names
-        self.llm = llm
-        self.settings = settings
-        self.progress_callback = progress_callback
-        self.temperature = settings.get('temperature', 0.7)
-        self.top_p = settings.get('top_p', 0.9)
-        self.batch_size = settings.get('batch_size', 5)
-        self.max_tokens = settings.get('max_tokens', 500)
-        self.order = settings.get('order', 'Most Relevant First')
-        self.synthesis = settings.get('synthesis', 'Contextual Linking')
-        self.cluster_count = settings.get('cluster_count', 3)
-        self.drop_threshold = settings.get('drop_threshold', 0.3)
-
-        # Step 1: Order chunks
-        self.ordered_chunks = self._order_chunks()
-        self.project_names_ordered = self._order_project_names()
-
-        # Step 2: Process batches with chosen synthesis
-        self.summaries = self._process_batches()
-
-        # Step 3: Cluster summaries
-        self.clusters = self._cluster_summaries()
-
-        # Step 4: Generate articles from clusters
-        self.articles = self._generate_articles()
-
-        # Step 5: Final synthesis
-        self.final_answer = self._final_synthesis()
-
-    def _order_chunks(self) -> List[str]:
-        """Order chunks according to user setting."""
-        if self.order == 'Most Relevant First':
-            scorer = MLRelevanceScorer(self.chunks, self.query)
-            scored = [(chunk, scorer.score_chunk(chunk)) for chunk in self.chunks]
-            scored.sort(key=lambda x: x[1], reverse=True)
-            return [chunk for chunk, _ in scored]
-        elif self.order == 'Least Relevant First':
-            scorer = MLRelevanceScorer(self.chunks, self.query)
-            scored = [(chunk, scorer.score_chunk(chunk)) for chunk in self.chunks]
-            scored.sort(key=lambda x: x[1])
-            return [chunk for chunk, _ in scored]
-        elif self.order == 'A-Z':
-            return self.chunks
-        elif self.order == 'Z-A':
-            return list(reversed(self.chunks))
-        else:
-            return self.chunks
-
-    def _order_project_names(self) -> List[str]:
-        chunk_to_project = {}
-        for i, chunk in enumerate(self.chunks):
-            chunk_to_project[chunk] = self.project_names[i]
-        return [chunk_to_project[chunk] for chunk in self.ordered_chunks]
-
-    def _process_batches(self) -> List[str]:
-        summaries = []
-        total_chunks = len(self.ordered_chunks)
-        total_batches = (total_chunks + self.batch_size - 1) // self.batch_size
-        last_chunk = ""
-
-        for batch_num in range(total_batches):
-            start = batch_num * self.batch_size
-            end = min(start + self.batch_size, total_chunks)
-            batch = self.ordered_chunks[start:end]
-            batch_projects = self.project_names_ordered[start:end]
-
-            if self.synthesis == 'Contextual Linking' and last_chunk:
-                batch_with_context = [last_chunk] + batch
-            else:
-                batch_with_context = batch
-
-            context = '\n\n'.join(batch_with_context)
-
-            if self.synthesis == 'Summarization':
-                prompt = self._summarization_prompt(context, batch_num+1, total_batches)
-            elif self.synthesis == 'Claim Listing':
-                prompt = self._claim_listing_prompt(context, summaries, batch_num+1, total_batches)
-            else:  # Contextual Linking
-                prev_summary = summaries[-1] if summaries else "None"
-                prompt = self._contextual_linking_prompt(context, prev_summary, batch_num+1, total_batches)
-
-            response = self._call_llm(prompt, max_tokens=100)
-            if response:
-                summaries.append(response)
-                if self.synthesis == 'Contextual Linking' and batch:
-                    last_chunk = batch[-1]
-
-                if self.progress_callback:
-                    self.progress_callback('batch', batch_num+1, total_batches, response, batch_projects[0] if batch_projects else '')
-
-        return summaries
-
-    def _summarization_prompt(self, context: str, batch_num: int, total: int) -> str:
-        return f"""Summarize the key points from the following text (batch {batch_num} of {total}):
-
-{context}
-
-Provide a concise summary (4-10 sentences)."""
-
-    def _claim_listing_prompt(self, context: str, previous_summaries: List[str], batch_num: int, total: int) -> str:
-        prev_claims = '\n'.join(previous_summaries) if previous_summaries else "None"
-        return f"""List every unique claim or fact from the following text (batch {batch_num} of {total}) that is NOT already mentioned in the previous claims.
-
-Previous claims:
-{prev_claims}
-
-New text:
-{context}
-
-List each new claim as a separate sentence. Do not repeat previous claims."""
-
-    def _contextual_linking_prompt(self, context: str, prev_summary: str, batch_num: int, total: int) -> str:
-        return f"""Given the previous summary of earlier information:
-{prev_summary}
-
-Now read the new text (batch {batch_num} of {total}):
-{context}
-
-Identify any new insights, concepts, or ideas that are NOT covered in the previous summary. Provide a brief summary of these new elements (2-10 sentences). Focus only on what is novel."""
-
-    def _call_llm(self, prompt: str, max_tokens: int) -> str:
-        try:
-            response = self.llm(
-                prompt,
-                max_tokens=max_tokens,
-                temperature=self.temperature,
-                top_p=self.top_p,
-                stop=["###", "---", "```"]
-            )
-            content = response['choices'][0]['text'].strip()
-            return content if content else ""
-        except Exception as e:
-            print(f"⚠️ LLM call error: {e}")
-            return ""
-
-    def _cluster_summaries(self) -> List[List[str]]:
-        if not self.summaries:
-            return []
-
-        # Score summaries for relevance to query to find anchors
-        scorer = MLRelevanceScorer(self.summaries, self.query)
-        scored = [(summary, scorer.score_chunk(summary)) for summary in self.summaries]
-        scored.sort(key=lambda x: x[1], reverse=True)
-
-        anchors = scored[:self.cluster_count]
-        anchor_indices = [self.summaries.index(summary) for summary, _ in anchors]
-
-        # Create vectorizer for computing similarity between summaries
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        vectorizer = TfidfVectorizer(max_features=100, stop_words='english')
-        summary_vectors = vectorizer.fit_transform(self.summaries)
-
-        clusters = []
-        for anchor_idx in anchor_indices:
-            cluster = [self.summaries[anchor_idx]]
-            anchor_vector = summary_vectors[anchor_idx]
-
-            # Expand backwards
-            idx = anchor_idx - 1
-            while idx >= 0:
-                sim = cosine_similarity(anchor_vector, summary_vectors[idx])[0][0]
-                if sim < self.drop_threshold:
-                    break
-                cluster.insert(0, self.summaries[idx])
-                idx -= 1
-
-            # Expand forwards
-            idx = anchor_idx + 1
-            while idx < len(self.summaries):
-                sim = cosine_similarity(anchor_vector, summary_vectors[idx])[0][0]
-                if sim < self.drop_threshold:
-                    break
-                cluster.append(self.summaries[idx])
-                idx += 1
-
-            clusters.append(cluster)
-
-        return clusters
-
-    def _generate_articles(self) -> List[str]:
-        articles = []
-        for i, cluster in enumerate(self.clusters):
-            cluster_text = '\n\n'.join(cluster)
-            prompt = f"""Write a coherent article based on the following insights (Cluster {i+1}).
-
-Insights:
-{cluster_text}
-
-The article should flow logically and cover all the key points. Keep it concise but comprehensive."""
-            article = self._call_llm(prompt, max_tokens=400)
-            if article:
-                articles.append(article)
-                if self.progress_callback:
-                    self.progress_callback('article', i+1, len(self.clusters), article, '')
-        return articles
-
-    def _final_synthesis(self) -> str:
-        if not self.articles:
-            return "No articles generated."
-
-        scorer = MLRelevanceScorer(self.articles, self.query)
-        scored = [(article, scorer.score_chunk(article)) for article in self.articles]
-        scored.sort(key=lambda x: x[1])  # least to most relevant
-
-        final_text = '\n\n'.join([article for article, _ in scored])
-        prompt = f"""Synthesize the following articles into a single, comprehensive final answer to the query: "{self.query}".
-
-Articles (ordered from least to most relevant):
-{final_text}
-
-Create a final answer that integrates all the information, highlights the most important points, and provides a clear, structured response."""
-        final = self._call_llm(prompt, max_tokens=600)
-        return final if final else final_text
 
 class MLRelevanceScorer:
     """
@@ -289,25 +71,123 @@ class MLRelevanceScorer:
     def score_chunk(self, chunk: str) -> float:
         """Return precomputed score for a chunk."""
         return self.score_dict.get(chunk, 0.0)
-class SettingsDialog(QDialog):
-    """Dialog for processing settings."""
+
+
+class ListSettingsDialog(QDialog):
+    """Dialog for list generation settings."""
 
     def __init__(self, parent=None, current_settings=None):
         super().__init__(parent)
-        self.setWindowTitle("⚙️ Processing Settings")
-        self.setMinimumSize(500, 450)
+        self.setWindowTitle("⚙️ List Settings")
+        self.setMinimumSize(400, 350)
 
         layout = QVBoxLayout(self)
 
-        # Processing Mode - ALL 5 MODES
+        # Max Items
+        h1 = QHBoxLayout()
+        h1.addWidget(QLabel("Max Items:"))
+        self.max_items_spin = QSpinBox()
+        self.max_items_spin.setRange(1, 9999)
+        self.max_items_spin.setValue(50)
+        self.max_items_spin.setToolTip("Maximum number of list items to extract (0 = all)")
+        if current_settings and 'max_items' in current_settings:
+            self.max_items_spin.setValue(current_settings['max_items'])
+        h1.addWidget(self.max_items_spin)
+        h1.addWidget(QLabel("(0 = all)"))
+        h1.addStretch()
+        layout.addLayout(h1)
+
+        # Max Tokens per Generation
+        h2 = QHBoxLayout()
+        h2.addWidget(QLabel("Max Tokens per Item:"))
+        self.max_tokens_spin = QSpinBox()
+        self.max_tokens_spin.setRange(50, 4096)
+        self.max_tokens_spin.setValue(200)
+        self.max_tokens_spin.setToolTip("Maximum tokens for each list item generation")
+        if current_settings and 'max_tokens' in current_settings:
+            self.max_tokens_spin.setValue(current_settings['max_tokens'])
+        h2.addWidget(self.max_tokens_spin)
+        h2.addStretch()
+        layout.addLayout(h2)
+
+        # Processing Method
+        h3 = QHBoxLayout()
+        h3.addWidget(QLabel("Process Method:"))
+        self.method_combo = QComboBox()
+        self.method_combo.addItems(["Exact Match", "Similarity Search", "Summarize", "Extract Numbers"])
+        if current_settings and 'method' in current_settings:
+            idx = self.method_combo.findText(current_settings['method'])
+            if idx >= 0:
+                self.method_combo.setCurrentIndex(idx)
+        h3.addWidget(self.method_combo)
+        h3.addStretch()
+        layout.addLayout(h3)
+
+        # Order
+        h4 = QHBoxLayout()
+        h4.addWidget(QLabel("Order:"))
+        self.order_combo = QComboBox()
+        self.order_combo.addItems(["Relevancy", "A-Z", "Z-A", "As Provided"])
+        if current_settings and 'order' in current_settings:
+            idx = self.order_combo.findText(current_settings['order'])
+            if idx >= 0:
+                self.order_combo.setCurrentIndex(idx)
+        h4.addWidget(self.order_combo)
+        h4.addStretch()
+        layout.addLayout(h4)
+
+        # Top K for Similarity
+        h5 = QHBoxLayout()
+        h5.addWidget(QLabel("Top K (similarity):"))
+        self.top_k_spin = QSpinBox()
+        self.top_k_spin.setRange(1, 50)
+        self.top_k_spin.setValue(5)
+        if current_settings and 'top_k' in current_settings:
+            self.top_k_spin.setValue(current_settings['top_k'])
+        h5.addWidget(self.top_k_spin)
+        h5.addStretch()
+        layout.addLayout(h5)
+
+        # Include Context checkbox
+        self.context_check = QCheckBox("Include Context in Results")
+        self.context_check.setChecked(True)
+        if current_settings and 'include_context' in current_settings:
+            self.context_check.setChecked(current_settings['include_context'])
+        layout.addWidget(self.context_check)
+
+        # Buttons
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+        self.setLayout(layout)
+
+    def get_settings(self) -> dict:
+        return {
+            'max_items': self.max_items_spin.value(),
+            'max_tokens': self.max_tokens_spin.value(),
+            'method': self.method_combo.currentText(),
+            'order': self.order_combo.currentText(),
+            'top_k': self.top_k_spin.value(),
+            'include_context': self.context_check.isChecked()
+        }
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None, current_settings=None):
+        super().__init__(parent)
+        self.setWindowTitle("⚙️ Processing Settings")
+        self.setMinimumSize(550, 500)
+
+        layout = QVBoxLayout(self)
+
+        # Processing Mode - ONLY 3 MODES
         layout.addWidget(QLabel("Processing Mode:"))
         self.mode_combo = QComboBox()
         self.mode_combo.addItems([
             "Relevancy",
-            "Sequential",
             "Hierarchical",
-            "Contextual",
-            "Sentence Clustering"   # <-- NEW MODE
+            "Sentence Clustering"
         ])
         if current_settings and 'mode' in current_settings:
             idx = self.mode_combo.findText(current_settings['mode'])
@@ -316,7 +196,15 @@ class SettingsDialog(QDialog):
         self.mode_combo.currentTextChanged.connect(self._update_visibility)
         layout.addWidget(self.mode_combo)
 
-        # Relevancy/Hierarchical specific settings
+        # List Output Toggle
+        self.list_output_check = QCheckBox("📋 List Output Mode")
+        self.list_output_check.setChecked(False)
+        if current_settings and 'list_output' in current_settings:
+            self.list_output_check.setChecked(current_settings['list_output'])
+        self.list_output_check.toggled.connect(self._update_visibility)
+        layout.addWidget(self.list_output_check)
+
+        # Relevancy settings
         self.relevancy_group = QGroupBox("Relevancy Settings")
         relevancy_layout = QVBoxLayout(self.relevancy_group)
 
@@ -339,78 +227,16 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(self.relevancy_group)
 
-        # Sequential specific settings
-        self.seq_group = QGroupBox("Sequential Settings")
-        seq_layout = QVBoxLayout(self.seq_group)
+        # Hierarchical settings (share Relevancy settings)
+        self.hierarchical_group = QGroupBox("Hierarchical Settings")
+        hierarchical_layout = QVBoxLayout(self.hierarchical_group)
+        hierarchical_layout.addWidget(QLabel("Uses the same settings as Relevancy mode."))
+        layout.addWidget(self.hierarchical_group)
 
-        h_target = QHBoxLayout()
-        h_target.addWidget(QLabel("Target Chunks per Project:"))
-        self.target_chunks_spinner = QSpinBox()
-        self.target_chunks_spinner.setRange(1, 50)
-        self.target_chunks_spinner.setValue(10)
-        if current_settings and 'target_chunks' in current_settings:
-            self.target_chunks_spinner.setValue(current_settings['target_chunks'])
-        h_target.addWidget(self.target_chunks_spinner)
-        h_target.addStretch()
-        seq_layout.addLayout(h_target)
-
-        seq_layout.addWidget(QLabel("Processes all chunks in original order (A-Z)."))
-        layout.addWidget(self.seq_group)
-
-        # Contextual specific settings
-        self.contextual_group = QGroupBox("Contextual Settings")
-        contextual_layout = QVBoxLayout(self.contextual_group)
-
-        h_order = QHBoxLayout()
-        h_order.addWidget(QLabel("Chunk Order:"))
-        self.order_combo = QComboBox()
-        self.order_combo.addItems(["Most Relevant First", "Least Relevant First", "A-Z", "Z-A"])
-        if current_settings and 'order' in current_settings:
-            idx = self.order_combo.findText(current_settings['order'])
-            if idx >= 0:
-                self.order_combo.setCurrentIndex(idx)
-        h_order.addWidget(self.order_combo)
-        contextual_layout.addLayout(h_order)
-
-        h_synth = QHBoxLayout()
-        h_synth.addWidget(QLabel("Synthesis Method:"))
-        self.synth_combo = QComboBox()
-        self.synth_combo.addItems(["Summarization", "Claim Listing", "Contextual Linking"])
-        if current_settings and 'synthesis' in current_settings:
-            idx = self.synth_combo.findText(current_settings['synthesis'])
-            if idx >= 0:
-                self.synth_combo.setCurrentIndex(idx)
-        h_synth.addWidget(self.synth_combo)
-        contextual_layout.addLayout(h_synth)
-
-        h_cluster = QHBoxLayout()
-        h_cluster.addWidget(QLabel("Number of Clusters:"))
-        self.cluster_spin = QSpinBox()
-        self.cluster_spin.setRange(1, 10)
-        self.cluster_spin.setValue(3)
-        if current_settings and 'cluster_count' in current_settings:
-            self.cluster_spin.setValue(current_settings['cluster_count'])
-        h_cluster.addWidget(self.cluster_spin)
-        contextual_layout.addLayout(h_cluster)
-
-        h_thresh = QHBoxLayout()
-        h_thresh.addWidget(QLabel("Relevance Drop Threshold:"))
-        self.thresh_spin = QDoubleSpinBox()
-        self.thresh_spin.setRange(0.0, 1.0)
-        self.thresh_spin.setSingleStep(0.05)
-        self.thresh_spin.setValue(0.3)
-        if current_settings and 'drop_threshold' in current_settings:
-            self.thresh_spin.setValue(current_settings['drop_threshold'])
-        h_thresh.addWidget(self.thresh_spin)
-        contextual_layout.addLayout(h_thresh)
-
-        layout.addWidget(self.contextual_group)
-
-        # Sentence Clustering specific settings
+        # Sentence Clustering settings
         self.cluster_group = QGroupBox("Sentence Clustering Settings")
         cluster_layout = QVBoxLayout(self.cluster_group)
 
-        # Relevancy threshold
         h_sent_thresh = QHBoxLayout()
         h_sent_thresh.addWidget(QLabel("Sentence Relevancy Threshold:"))
         self.sentence_thresh_spin = QDoubleSpinBox()
@@ -422,7 +248,6 @@ class SettingsDialog(QDialog):
         h_sent_thresh.addWidget(self.sentence_thresh_spin)
         cluster_layout.addLayout(h_sent_thresh)
 
-        # Clustering levels
         h_levels = QHBoxLayout()
         h_levels.addWidget(QLabel("Further Clustering Levels:"))
         self.levels_spin = QSpinBox()
@@ -433,7 +258,6 @@ class SettingsDialog(QDialog):
         h_levels.addWidget(self.levels_spin)
         cluster_layout.addLayout(h_levels)
 
-        # Top K clusters for final context
         h_topk = QHBoxLayout()
         h_topk.addWidget(QLabel("Top K Clusters for Answer:"))
         self.topk_clusters_spin = QSpinBox()
@@ -445,7 +269,99 @@ class SettingsDialog(QDialog):
         cluster_layout.addLayout(h_topk)
 
         layout.addWidget(self.cluster_group)
-        self.cluster_group.setVisible(False)  # hidden by default
+
+        # === SYNTHESIS SETTINGS (for non-list output) ===
+        self.synthesis_group = QGroupBox("Synthesis Settings")
+        synthesis_layout = QVBoxLayout(self.synthesis_group)
+
+        h_synth = QHBoxLayout()
+        h_synth.addWidget(QLabel("Max Tokens:"))
+        self.max_tokens_spinner = QSpinBox()
+        self.max_tokens_spinner.setRange(100, 4096)
+        self.max_tokens_spinner.setValue(400)
+        if current_settings and 'max_tokens' in current_settings:
+            self.max_tokens_spinner.setValue(current_settings['max_tokens'])
+        h_synth.addWidget(self.max_tokens_spinner)
+        h_synth.addStretch()
+        synthesis_layout.addLayout(h_synth)
+
+        h_temp = QHBoxLayout()
+        h_temp.addWidget(QLabel("Temperature:"))
+        self.temperature_spinner = QDoubleSpinBox()
+        self.temperature_spinner.setRange(0.0, 2.0)
+        self.temperature_spinner.setSingleStep(0.1)
+        self.temperature_spinner.setValue(0.7)
+        if current_settings and 'temperature' in current_settings:
+            self.temperature_spinner.setValue(current_settings['temperature'])
+        h_temp.addWidget(self.temperature_spinner)
+        h_temp.addStretch()
+        synthesis_layout.addLayout(h_temp)
+
+        h_topp = QHBoxLayout()
+        h_topp.addWidget(QLabel("Top P:"))
+        self.top_p_spinner = QDoubleSpinBox()
+        self.top_p_spinner.setRange(0.0, 1.0)
+        self.top_p_spinner.setSingleStep(0.05)
+        self.top_p_spinner.setValue(0.9)
+        if current_settings and 'top_p' in current_settings:
+            self.top_p_spinner.setValue(current_settings['top_p'])
+        h_topp.addWidget(self.top_p_spinner)
+        h_topp.addStretch()
+        synthesis_layout.addLayout(h_topp)
+
+        layout.addWidget(self.synthesis_group)
+
+        # === LIST SETTINGS (for list output) ===
+        self.list_group = QGroupBox("List Output Settings")
+        list_layout = QVBoxLayout(self.list_group)
+
+        h_list_tokens = QHBoxLayout()
+        h_list_tokens.addWidget(QLabel("Max Tokens per Item:"))
+        self.list_tokens_spinner = QSpinBox()
+        self.list_tokens_spinner.setRange(50, 4096)
+        self.list_tokens_spinner.setValue(150)
+        if current_settings and 'list_tokens' in current_settings:
+            self.list_tokens_spinner.setValue(current_settings['list_tokens'])
+        h_list_tokens.addWidget(self.list_tokens_spinner)
+        h_list_tokens.addStretch()
+        list_layout.addLayout(h_list_tokens)
+
+        h_list_sentences = QHBoxLayout()
+        h_list_sentences.addWidget(QLabel("Sentences per Item:"))
+        self.list_sentences_spinner = QSpinBox()
+        self.list_sentences_spinner.setRange(1, 20)
+        self.list_sentences_spinner.setValue(3)
+        if current_settings and 'list_sentences' in current_settings:
+            self.list_sentences_spinner.setValue(current_settings['list_sentences'])
+        h_list_sentences.addWidget(self.list_sentences_spinner)
+        h_list_sentences.addStretch()
+        list_layout.addLayout(h_list_sentences)
+
+        h_list_temp = QHBoxLayout()
+        h_list_temp.addWidget(QLabel("Temperature:"))
+        self.list_temp_spinner = QDoubleSpinBox()
+        self.list_temp_spinner.setRange(0.0, 2.0)
+        self.list_temp_spinner.setSingleStep(0.1)
+        self.list_temp_spinner.setValue(0.6)
+        if current_settings and 'list_temp' in current_settings:
+            self.list_temp_spinner.setValue(current_settings['list_temp'])
+        h_list_temp.addWidget(self.list_temp_spinner)
+        h_list_temp.addStretch()
+        list_layout.addLayout(h_list_temp)
+
+        h_list_topp = QHBoxLayout()
+        h_list_topp.addWidget(QLabel("Top P:"))
+        self.list_topp_spinner = QDoubleSpinBox()
+        self.list_topp_spinner.setRange(0.0, 1.0)
+        self.list_topp_spinner.setSingleStep(0.05)
+        self.list_topp_spinner.setValue(0.9)
+        if current_settings and 'list_topp' in current_settings:
+            self.list_topp_spinner.setValue(current_settings['list_topp'])
+        h_list_topp.addWidget(self.list_topp_spinner)
+        h_list_topp.addStretch()
+        list_layout.addLayout(h_list_topp)
+
+        layout.addWidget(self.list_group)
 
         # Common settings
         common_group = QGroupBox("Common Settings")
@@ -462,17 +378,6 @@ class SettingsDialog(QDialog):
         h2.addStretch()
         common_layout.addLayout(h2)
 
-        h3 = QHBoxLayout()
-        h3.addWidget(QLabel("Max Tokens per Chunk:"))
-        self.max_tokens_spinner = QSpinBox()
-        self.max_tokens_spinner.setRange(100, 4096)
-        self.max_tokens_spinner.setValue(500)
-        if current_settings and 'max_tokens' in current_settings:
-            self.max_tokens_spinner.setValue(current_settings['max_tokens'])
-        h3.addWidget(self.max_tokens_spinner)
-        h3.addStretch()
-        common_layout.addLayout(h3)
-
         layout.addWidget(common_group)
 
         # Buttons
@@ -484,10 +389,14 @@ class SettingsDialog(QDialog):
         self._update_visibility(self.mode_combo.currentText())
 
     def _update_visibility(self, mode: str):
-        self.relevancy_group.setVisible(mode in ["Relevancy", "Hierarchical"])
-        self.seq_group.setVisible(mode == "Sequential")
-        self.contextual_group.setVisible(mode == "Contextual")
+        self.relevancy_group.setVisible(mode == "Relevancy")
+        self.hierarchical_group.setVisible(mode == "Hierarchical")
         self.cluster_group.setVisible(mode == "Sentence Clustering")
+
+        # Show/hide list and synthesis groups based on list output toggle
+        list_enabled = self.list_output_check.isChecked()
+        self.synthesis_group.setVisible(not list_enabled)
+        self.list_group.setVisible(list_enabled)
 
     def get_settings(self) -> dict:
         settings = {
@@ -495,30 +404,22 @@ class SettingsDialog(QDialog):
             'top_k': self.top_k_spinner.value(),
             'process_all': self.process_all_check.isChecked(),
             'batch_size': self.batch_size_spinner.value(),
+            'list_output': self.list_output_check.isChecked(),
+            'sentence_threshold': self.sentence_thresh_spin.value() if hasattr(self,
+                                                                               'sentence_thresh_spin') else 0.5,
+            'clustering_levels': self.levels_spin.value() if hasattr(self, 'levels_spin') else 0,
+            'top_k_clusters': self.topk_clusters_spin.value() if hasattr(self, 'topk_clusters_spin') else 5,
+            # Synthesis settings
             'max_tokens': self.max_tokens_spinner.value(),
-            'target_chunks': self.target_chunks_spinner.value() if hasattr(self, 'target_chunks_spinner') else 10,
+            'temperature': self.temperature_spinner.value(),
+            'top_p': self.top_p_spinner.value(),
+            # List settings
+            'list_tokens': self.list_tokens_spinner.value() if hasattr(self, 'list_tokens_spinner') else 150,
+            'list_sentences': self.list_sentences_spinner.value() if hasattr(self, 'list_sentences_spinner') else 3,
+            'list_temp': self.list_temp_spinner.value() if hasattr(self, 'list_temp_spinner') else 0.6,
+            'list_topp': self.list_topp_spinner.value() if hasattr(self, 'list_topp_spinner') else 0.9,
         }
-
-        # Contextual settings
-        if hasattr(self, 'order_combo'):
-            settings['order'] = self.order_combo.currentText()
-        if hasattr(self, 'synth_combo'):
-            settings['synthesis'] = self.synth_combo.currentText()
-        if hasattr(self, 'cluster_spin'):
-            settings['cluster_count'] = self.cluster_spin.value()
-        if hasattr(self, 'thresh_spin'):
-            settings['drop_threshold'] = self.thresh_spin.value()
-
-        # Sentence Clustering settings
-        if hasattr(self, 'sentence_thresh_spin'):
-            settings['sentence_threshold'] = self.sentence_thresh_spin.value()
-        if hasattr(self, 'levels_spin'):
-            settings['clustering_levels'] = self.levels_spin.value()
-        if hasattr(self, 'topk_clusters_spin'):
-            settings['top_k_clusters'] = self.topk_clusters_spin.value()
-
         return settings
-
 class VectorStore:
     """Vector store for RAG (Retrieval-Augmented Generation)."""
 
@@ -749,7 +650,6 @@ class WebExtractor:
         html = unescape(html)
         html = re.sub(r'\s+', ' ', html)
         return html.strip()
-
 class SentenceClusterProcessor:
     """
     Sentence-level clustering: split into sentences, build clusters by relevance,
@@ -796,9 +696,7 @@ class SentenceClusterProcessor:
     def _extract_sentences(self) -> List[str]:
         """Combine all chunks and split into sentences."""
         full_text = '\n\n'.join(self.chunks)
-        # Use a simple sentence splitter (could be improved)
         sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', full_text)
-        # Clean up
         sentences = [s.strip() for s in sentences if s.strip()]
         return sentences
 
@@ -807,78 +705,75 @@ class SentenceClusterProcessor:
         if not self.sentences:
             return []
 
-        # We'll use a TF-IDF vectorizer for relevance scoring
         from sklearn.feature_extraction.text import TfidfVectorizer
         vectorizer = TfidfVectorizer(max_features=100, stop_words='english')
-        # Fit on all sentences once
         sentence_vectors = vectorizer.fit_transform(self.sentences)
 
         clusters = []
-        # Start with the first sentence as the anchor of the first cluster
         current_cluster = [self.sentences[0]]
-        anchor_idx = 0  # index of the anchor sentence in the original list
 
         for i in range(1, len(self.sentences)):
-            # Compute relevance scores
             # 1. Relevance to last 2 sentences (heaviest)
             if len(current_cluster) >= 2:
-                last_two = current_cluster[-2:]
-                sim_last2 = np.mean([cosine_similarity(sentence_vectors[i], sentence_vectors[self.sentences.index(s)])[0][0] for s in last_two])
+                sims = []
+                for s in current_cluster[-2:]:
+                    sim = cosine_similarity(sentence_vectors[i], sentence_vectors[self.sentences.index(s)])[0][0]
+                    sims.append(sim)
+                sim_last2 = np.mean(sims)
             else:
                 sim_last2 = cosine_similarity(sentence_vectors[i], sentence_vectors[self.sentences.index(current_cluster[-1])])[0][0]
 
             # 2. Relevance to first 2 sentences (medium)
             if len(current_cluster) >= 2:
-                first_two = current_cluster[:2]
-                sim_first2 = np.mean([cosine_similarity(sentence_vectors[i], sentence_vectors[self.sentences.index(s)])[0][0] for s in first_two])
+                sims = []
+                for s in current_cluster[:2]:
+                    sim = cosine_similarity(sentence_vectors[i], sentence_vectors[self.sentences.index(s)])[0][0]
+                    sims.append(sim)
+                sim_first2 = np.mean(sims)
             else:
-                sim_first2 = sim_last2  # fallback
+                sim_first2 = sim_last2
 
             # 3. Relevance to entire cluster (lightest)
-            cluster_vectors = [sentence_vectors[self.sentences.index(s)] for s in current_cluster]
-            sim_cluster = np.mean([cosine_similarity(sentence_vectors[i], v)[0][0] for v in cluster_vectors])
+            sims = []
+            for s in current_cluster:
+                sim = cosine_similarity(sentence_vectors[i], sentence_vectors[self.sentences.index(s)])[0][0]
+                sims.append(sim)
+            sim_cluster = np.mean(sims)
 
-            # Weighted combined score
             combined = 0.5 * sim_last2 + 0.3 * sim_first2 + 0.2 * sim_cluster
 
             if combined < self.threshold:
-                # Start a new cluster
                 clusters.append(current_cluster)
                 current_cluster = [self.sentences[i]]
             else:
                 current_cluster.append(self.sentences[i])
 
-        # Add the last cluster
         if current_cluster:
             clusters.append(current_cluster)
 
         return clusters
 
     def _further_cluster(self) -> List[List[str]]:
-        """
-        Combine the most similar clusters iteratively.
-        This reduces the number of clusters by pairing them.
-        """
+        """Combine the most similar clusters iteratively."""
         if len(self.clusters) <= 1:
             return self.clusters
 
-        # Vectorize clusters (average of sentence vectors)
         from sklearn.feature_extraction.text import TfidfVectorizer
-        # Flatten all sentences to build a consistent vectorizer
         all_sentences = [s for cluster in self.clusters for s in cluster]
         vectorizer = TfidfVectorizer(max_features=100, stop_words='english')
         all_vectors = vectorizer.fit_transform(all_sentences)
 
-        # Compute cluster vectors (average of sentence vectors)
         cluster_vectors = []
         start = 0
         for cluster in self.clusters:
             end = start + len(cluster)
-            cluster_vec = np.mean(all_vectors[start:end], axis=0)
+            # Convert sparse matrix to dense and then take mean
+            cluster_vec = np.asarray(np.mean(all_vectors[start:end], axis=0))
+            if cluster_vec.ndim == 1:
+                cluster_vec = cluster_vec.reshape(1, -1)
             cluster_vectors.append(cluster_vec)
             start = end
 
-        # Pair up most similar clusters
         new_clusters = []
         used = [False] * len(self.clusters)
 
@@ -887,7 +782,7 @@ class SentenceClusterProcessor:
                 continue
             best_match = -1
             best_score = -1
-            for j in range(i+1, len(self.clusters)):
+            for j in range(i + 1, len(self.clusters)):
                 if used[j]:
                     continue
                 sim = cosine_similarity(cluster_vectors[i], cluster_vectors[j])[0][0]
@@ -895,17 +790,14 @@ class SentenceClusterProcessor:
                     best_score = sim
                     best_match = j
             if best_match != -1:
-                # Combine clusters i and best_match
                 combined = self.clusters[i] + self.clusters[best_match]
                 new_clusters.append(combined)
                 used[i] = True
                 used[best_match] = True
             else:
-                # No match, keep cluster i as is
                 new_clusters.append(self.clusters[i])
                 used[i] = True
 
-        # Handle any remaining clusters (shouldn't happen but just in case)
         for i, used_flag in enumerate(used):
             if not used_flag:
                 new_clusters.append(self.clusters[i])
@@ -917,19 +809,14 @@ class SentenceClusterProcessor:
         if not self.clusters:
             return []
 
-        # Score each cluster by average relevance of its sentences to the query
-        scorer = MLRelevanceScorer(self.sentences, self.query)  # we can reuse
+        scorer = MLRelevanceScorer(self.sentences, self.query)
         cluster_scores = []
         for cluster in self.clusters:
-            # Average score of sentences in cluster
             scores = [scorer.score_chunk(s) for s in cluster]
             avg_score = sum(scores) / len(scores) if scores else 0
             cluster_scores.append((cluster, avg_score))
 
-        # Sort by score descending (most relevant first)
         cluster_scores.sort(key=lambda x: x[1], reverse=True)
-
-        # Take top K or all if fewer
         selected = [cluster for cluster, _ in cluster_scores[:self.top_k_clusters]]
         return selected
 
@@ -937,20 +824,14 @@ class SentenceClusterProcessor:
         """For each selected cluster, distill insights into a concise summary."""
         distilled = []
         for cluster in self.selected_clusters:
-            # Combine cluster text
             cluster_text = ' '.join(cluster)
-            # If too long, chunk and distill incrementally
             if self._count_tokens(cluster_text) > self.max_tokens:
-                # Chunk into sentences with token limit
                 chunks = self._chunk_text(cluster_text, self.max_tokens)
-                # Distill first chunk
                 summary = self._distill_chunk(chunks[0])
-                # Then merge subsequent chunks with unique info
                 for chunk in chunks[1:]:
                     summary = self._merge_summaries(summary, self._distill_chunk(chunk))
                 distilled.append(summary)
             else:
-                # Single distillation
                 summary = self._distill_chunk(cluster_text)
                 distilled.append(summary)
         return distilled
@@ -1019,7 +900,6 @@ Merged Summary:"""
         """Break down each distilled insight into individual claims (sentences)."""
         claims = []
         for insight in distilled_insights:
-            # Split by sentence boundaries
             sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', insight)
             claims.extend([s.strip() for s in sentences if s.strip()])
         return claims
@@ -1029,23 +909,17 @@ Merged Summary:"""
         if not claims:
             return ""
 
-        # Score each claim by relevance to query
         scorer = MLRelevanceScorer(claims, self.query)
         scored = [(claim, scorer.score_chunk(claim)) for claim in claims]
-        # Sort by score descending
         scored.sort(key=lambda x: x[1], reverse=True)
 
-        # Take the most relevant as anchor
         anchor = scored[0][0]
         context_parts = [anchor]
         used = {anchor}
         total_tokens = self._count_tokens(anchor)
 
-        # Greedily add other claims by relevance to anchor (not to query)
-        # Re-score relevance to anchor
         anchor_scorer = MLRelevanceScorer(claims, anchor)
         remaining = [c for c, _ in scored[1:]]
-        # Sort by relevance to anchor
         remaining.sort(key=lambda c: anchor_scorer.score_chunk(c), reverse=True)
 
         for claim in remaining:
@@ -1066,19 +940,14 @@ Merged Summary:"""
         if not self.distilled_insights:
             return "No insights could be distilled."
 
-        # Extract claims
         claims = self._extract_claims(self.distilled_insights)
-
         if not claims:
             return "No claims extracted."
 
-        # Build context
         context = self._build_context(claims)
-
         if not context:
             return "No context could be built."
 
-        # Generate answer
         prompt = f"""Answer the following query based solely on the provided context.
 
 QUERY: {self.query}
@@ -1088,7 +957,6 @@ CONTEXT:
 
 ANSWER:"""
         return self._call_llm(prompt, max_tokens=400)
-
 
 class DataProcessor:
     """Process all selected projects' data into chunks with project tracking."""
@@ -1217,7 +1085,12 @@ class ProgressiveRAGEngine:
                  temperature: float = 0.7, top_p: float = 0.9,
                  mode: str = "Relevancy", top_k: int = 20,
                  process_all: bool = False, batch_size: int = 5,
-                 max_tokens: int = 500,
+                 max_tokens: int = 400,
+                 list_output: bool = False,
+                 list_tokens: int = 150,
+                 list_sentences: int = 3,
+                 list_temp: float = 0.6,
+                 list_topp: float = 0.9,
                  sentence_threshold: float = 0.5,
                  clustering_levels: int = 0,
                  top_k_clusters: int = 5,
@@ -1231,6 +1104,11 @@ class ProgressiveRAGEngine:
         self.process_all = process_all
         self.batch_size = batch_size
         self.max_tokens = max_tokens
+        self.list_output = list_output
+        self.list_tokens = list_tokens
+        self.list_sentences = list_sentences
+        self.list_temp = list_temp
+        self.list_topp = list_topp
         self.sentence_threshold = sentence_threshold
         self.clustering_levels = clustering_levels
         self.top_k_clusters = top_k_clusters
@@ -1242,149 +1120,6 @@ class ProgressiveRAGEngine:
         self.synthesis = "Contextual Linking"
         self.cluster_count = 3
         self.drop_threshold = 0.3
-
-    def log(self, text: str, prefix: str = "   "):
-        print(f"{prefix}{text}")
-
-    def query(self, query: str) -> str:
-        print("\n" + "=" * 60)
-        print(f"🔍 QUERY: {query}")
-        print(f"📋 MODE: {self.mode}")
-        print("=" * 60 + "\n")
-
-        project_names = self.vector_store.get_project_names()
-        if not project_names:
-            return "No projects available in the index."
-
-        print(f"📚 Found {len(project_names)} projects: {', '.join(project_names)}")
-
-        # Check if we're in Contextual mode - process all projects together
-        if self.mode == "Contextual":
-            all_chunks = []
-            all_project_names = []
-            for project in project_names:
-                chunks = self.vector_store.get_all_chunks_by_project(project)
-                if chunks:
-                    all_chunks.extend(chunks)
-                    all_project_names.extend([project] * len(chunks))
-
-            if not all_chunks:
-                return "No chunks found in any project."
-
-            print(f"📚 Processing {len(all_chunks)} chunks across {len(project_names)} projects")
-
-            # Get contextual settings
-            order = getattr(self, 'order', 'Most Relevant First')
-            synthesis = getattr(self, 'synthesis', 'Contextual Linking')
-            cluster_count = getattr(self, 'cluster_count', 3)
-            drop_threshold = getattr(self, 'drop_threshold', 0.3)
-
-            # Process with ContextualProcessor
-            processor = ContextualProcessor(
-                query, all_chunks, all_project_names, self.llm,
-                settings={
-                    'temperature': self.temperature,
-                    'top_p': self.top_p,
-                    'batch_size': self.batch_size,
-                    'max_tokens': self.max_tokens,
-                    'order': order,
-                    'synthesis': synthesis,
-                    'cluster_count': cluster_count,
-                    'drop_threshold': drop_threshold
-                },
-                progress_callback=self.progress_callback
-            )
-            return processor.final_answer
-
-        # Other modes (Relevancy, Sequential, Hierarchical) - process project by project
-        all_project_summaries = []
-        total_projects = len(project_names)
-
-        for idx, project_name in enumerate(project_names):
-            self.current_project = project_name
-            print(f"\n{'─' * 50}")
-            print(f"📖 PROJECT {idx + 1}/{total_projects}: {project_name}")
-            print(f"{'─' * 50}")
-
-            if self.mode == "Sentence Clustering":
-                all_chunks = []
-                all_project_names = []
-                for project in self.vector_store.get_project_names():
-                    chunks = self.vector_store.get_all_chunks_by_project(project)
-                    if chunks:
-                        all_chunks.extend(chunks)
-                        all_project_names.extend([project] * len(chunks))
-
-                if not all_chunks:
-                    return "No chunks found in any project."
-
-                processor = SentenceClusterProcessor(
-                    query, all_chunks, all_project_names, self.llm,
-                    settings={
-                        'temperature': self.temperature,
-                        'top_p': self.top_p,
-                        'batch_size': self.batch_size,
-                        'max_tokens': self.max_tokens,
-                        'sentence_threshold': getattr(self, 'sentence_threshold', 0.5),
-                        'clustering_levels': getattr(self, 'clustering_levels', 0),
-                        'top_k_clusters': getattr(self, 'top_k_clusters', 5)
-                    },
-                    progress_callback=self.progress_callback
-                )
-                return processor.final_answer
-
-            if self.mode == "Sequential":
-                chunks = self.vector_store.get_all_chunks_by_project(project_name)
-                print(f"   Processing all {len(chunks)} chunks sequentially")
-                if not chunks:
-                    print(f"   ⚠️ No chunks found in {project_name}")
-                    continue
-                project_summary = self._process_project_sequential(query, chunks, project_name)
-            else:  # Relevancy or Hierarchical
-                if self.process_all:
-                    all_chunks = self.vector_store.get_all_chunks_by_project(project_name)
-                    if not all_chunks:
-                        print(f"   ⚠️ No chunks found in {project_name}")
-                        continue
-                    scorer = MLRelevanceScorer(all_chunks, query)
-                    scored = [(chunk, scorer.score_chunk(chunk)) for chunk in all_chunks]
-                    scored.sort(key=lambda x: x[1], reverse=True)
-                    chunks = [chunk for chunk, _ in scored]
-                    print(f"   Processing all {len(chunks)} chunks sorted by relevance")
-                else:
-                    results = self.vector_store.search_by_project(query, project_name, self.top_k)
-                    chunks = [item[0] for item in results]
-                    print(f"   Found {len(chunks)} relevant chunks in {project_name}")
-                    if not chunks:
-                        print(f"   ⚠️ No relevant chunks found in {project_name}")
-                        continue
-
-                # Show top chunks
-                for i, chunk in enumerate(chunks[:3]):
-                    preview = chunk[:150] + "..." if len(chunk) > 150 else chunk
-                    print(f"   Chunk {i + 1}: {preview}")
-
-                project_summary = self._process_project_batches(query, chunks, project_name)
-
-            if project_summary:
-                all_project_summaries.append(project_summary)
-
-        if not all_project_summaries:
-            return "No relevant information found in any project."
-
-        print(f"\n{'=' * 60}")
-        print(f"🔄 FINAL SYNTHESIS")
-        print(f"{'=' * 60}\n")
-
-        if self.mode == "Hierarchical":
-            final_answer = self._hierarchical_synthesis(all_project_summaries, query)
-        else:
-            final_answer = self._direct_synthesis(query, all_project_summaries)
-
-        project_list = ', '.join(self.vector_store.get_project_names())
-        final_answer += f"\n\n---\n📚 Projects analyzed: {project_list}"
-        final_answer += f"\n📋 Mode: {self.mode}"
-        return final_answer
 
     def _process_project_batches(self, query: str, chunks: List[str], project_name: str) -> str:
         """Process chunks in batches and emit summaries."""
@@ -1425,21 +1160,52 @@ class ProgressiveRAGEngine:
 
     def _process_batch(self, query: str, batch: List[str], project_name: str, batch_num: int) -> str:
         context = '\n\n'.join([chunk[:300] + "..." if len(chunk) > 300 else chunk for chunk in batch])
-        prompt = f"""Based on the data provided, give a BRIEF answer (3-5 sentences) to the query.
 
-QUERY: {query}
+        # Choose settings based on output type
+        if self.list_output:
+            # List output: concise, structured, list-friendly
+            max_tokens = self.list_tokens
+            temperature = self.list_temp
+            top_p = self.list_topp
+            sentences = self.list_sentences
 
-DATA (from {project_name}):
-{context}
+            prompt = f"""Based on the data provided, extract the key insights as a list item.
 
-BRIEF ANSWER:"""
+    QUERY: {query}
+
+    DATA (from {project_name}):
+    {context}
+
+    Provide a concise, list-friendly insight ({sentences} sentences max).
+    Each insight should be a complete, standalone item.
+    Keep it brief and focused on the specific point.
+
+    INSIGHT:"""
+        else:
+            # Normal synthesis output
+            max_tokens = self.max_tokens
+            temperature = self.temperature
+            top_p = self.top_p
+
+            prompt = f"""Based on the data provided, give a BRIEF answer (3-5 sentences) to the query.
+
+    QUERY: {query}
+
+    DATA (from {project_name}):
+    {context}
+
+    BRIEF ANSWER:"""
+
         try:
-            max_tokens = max(40, min(100, len(batch) * 15))
+            # Override with batch-specific max tokens
+            if not self.list_output:
+                max_tokens = max(40, min(100, len(batch) * 15))
+
             response = self.llm(
                 prompt,
                 max_tokens=max_tokens,
-                temperature=self.temperature,
-                top_p=self.top_p,
+                temperature=temperature,
+                top_p=top_p,
                 stop=["###", "---", "```"]
             )
             content = response['choices'][0]['text'].strip()
@@ -1450,29 +1216,191 @@ BRIEF ANSWER:"""
 
     def _synthesize_project(self, query: str, batch_responses: List[str], project_name: str) -> str:
         combined = '\n\n'.join([f"{i + 1}. {resp}" for i, resp in enumerate(batch_responses)])
-        prompt = f"""Summarize the insights from this project.
 
-QUERY: {query}
+        if self.list_output:
+            # For list output, we want to keep items separate but clean
+            # Each batch response is already a list item
+            return f"📖 {project_name}:\n" + '\n'.join([f"• {resp}" for resp in batch_responses if resp])
+        else:
+            prompt = f"""Summarize the insights from this project.
 
-PROJECT: {project_name}
+    QUERY: {query}
 
-INSIGHTS FROM PROJECT:
-{combined}
+    PROJECT: {project_name}
 
-Create a brief summary (3-4 sentences) of what this project reveals about the query.
-Project Summary:"""
-        try:
-            response = self.llm(
-                prompt,
-                max_tokens=100,
-                temperature=self.temperature,
-                top_p=self.top_p,
-                stop=["###", "---", "```"]
+    INSIGHTS FROM PROJECT:
+    {combined}
+
+    Create a brief summary (3-4 sentences) of what this project reveals about the query.
+    Project Summary:"""
+            try:
+                response = self.llm(
+                    prompt,
+                    max_tokens=100,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    stop=["###", "---", "```"]
+                )
+                content = response['choices'][0]['text'].strip()
+                return f"📖 {project_name}: {content}" if content else ""
+            except:
+                return f"📖 {project_name}: Insights could not be synthesized."
+
+    def _direct_synthesis(self, query: str, project_summaries: List[str]) -> str:
+        if self.list_output:
+            # List output: concatenate all project summaries as list items
+            all_items = []
+            for summary in project_summaries:
+                # Each summary might contain multiple items
+                lines = summary.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if line and not line.startswith('📖'):
+                        # Clean up the line
+                        if line.startswith('•'):
+                            all_items.append(line[1:].strip())
+                        else:
+                            all_items.append(line)
+
+            if all_items:
+                # Format as a clean list
+                result = f"📋 List Results ({len(all_items)} items)\n"
+                result += "=" * 50 + "\n"
+                for i, item in enumerate(all_items, 1):
+                    result += f"\n{i}. {item}"
+                return result
+            else:
+                return "No list items found."
+        else:
+            # Normal synthesis
+            combined = '\n\n'.join(project_summaries)
+            prompt = f"""Create a comprehensive final answer synthesizing insights from multiple projects.
+
+    QUERY: {query}
+
+    INSIGHTS FROM EACH PROJECT:
+    {combined}
+
+    Create a well-structured final answer that:
+    1. Starts with a clear summary
+    2. Organizes findings by project
+    3. Highlights key patterns across projects
+    4. Provides practical takeaways
+
+    FINAL ANSWER:"""
+            try:
+                response = self.llm(
+                    prompt,
+                    max_tokens=600,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    stop=["###", "---", "```"]
+                )
+                content = response['choices'][0]['text'].strip()
+                return content if content else "No final answer could be synthesized."
+            except Exception as e:
+                print(f"❌ Synthesis error: {e}")
+                return f"Error synthesizing answers: {str(e)}"
+
+    def log(self, text: str, prefix: str = "   "):
+        print(f"{prefix}{text}")
+
+    def query(self, query: str) -> str:
+        print("\n" + "=" * 60)
+        print(f"🔍 QUERY: {query}")
+        print(f"📋 MODE: {self.mode}")
+        print("=" * 60 + "\n")
+
+        project_names = self.vector_store.get_project_names()
+        if not project_names:
+            return "No projects available in the index."
+
+        print(f"📚 Found {len(project_names)} projects: {', '.join(project_names)}")
+
+        # Sentence Clustering - process all projects together
+        if self.mode == "Sentence Clustering":
+            all_chunks = []
+            all_project_names = []
+            for project in project_names:
+                chunks = self.vector_store.get_all_chunks_by_project(project)
+                if chunks:
+                    all_chunks.extend(chunks)
+                    all_project_names.extend([project] * len(chunks))
+
+            if not all_chunks:
+                return "No chunks found in any project."
+
+            print(f"📚 Processing {len(all_chunks)} chunks across {len(project_names)} projects")
+
+            processor = SentenceClusterProcessor(
+                query, all_chunks, all_project_names, self.llm,
+                settings={
+                    'temperature': self.temperature,
+                    'top_p': self.top_p,
+                    'batch_size': self.batch_size,
+                    'max_tokens': self.max_tokens,
+                    'sentence_threshold': getattr(self, 'sentence_threshold', 0.5),
+                    'clustering_levels': getattr(self, 'clustering_levels', 0),
+                    'top_k_clusters': getattr(self, 'top_k_clusters', 5)
+                },
+                progress_callback=self.progress_callback
             )
-            content = response['choices'][0]['text'].strip()
-            return f"📖 {project_name}: {content}" if content else ""
-        except:
-            return f"📖 {project_name}: Insights could not be synthesized."
+            return processor.final_answer
+
+        # Other modes (Relevancy, Hierarchical) - process project by project
+        all_project_summaries = []
+        total_projects = len(project_names)
+
+        for idx, project_name in enumerate(project_names):
+            self.current_project = project_name
+            print(f"\n{'─' * 50}")
+            print(f"📖 PROJECT {idx + 1}/{total_projects}: {project_name}")
+            print(f"{'─' * 50}")
+
+            if self.process_all:
+                all_chunks = self.vector_store.get_all_chunks_by_project(project_name)
+                if not all_chunks:
+                    print(f"   ⚠️ No chunks found in {project_name}")
+                    continue
+                scorer = MLRelevanceScorer(all_chunks, query)
+                scored = [(chunk, scorer.score_chunk(chunk)) for chunk in all_chunks]
+                scored.sort(key=lambda x: x[1], reverse=True)
+                chunks = [chunk for chunk, _ in scored]
+                print(f"   Processing all {len(chunks)} chunks sorted by relevance")
+            else:
+                results = self.vector_store.search_by_project(query, project_name, self.top_k)
+                chunks = [item[0] for item in results]
+                print(f"   Found {len(chunks)} relevant chunks in {project_name}")
+                if not chunks:
+                    print(f"   ⚠️ No relevant chunks found in {project_name}")
+                    continue
+
+            # Show top chunks
+            for i, chunk in enumerate(chunks[:3]):
+                preview = chunk[:150] + "..." if len(chunk) > 150 else chunk
+                print(f"   Chunk {i + 1}: {preview}")
+
+            project_summary = self._process_project_batches(query, chunks, project_name)
+
+            if project_summary:
+                all_project_summaries.append(project_summary)
+
+        if not all_project_summaries:
+            return "No relevant information found in any project."
+
+        print(f"\n{'=' * 60}")
+        print(f"🔄 FINAL SYNTHESIS")
+        print(f"{'=' * 60}\n")
+
+        if self.mode == "Hierarchical":
+            final_answer = self._hierarchical_synthesis(all_project_summaries, query)
+        else:  # Relevancy
+            final_answer = self._direct_synthesis(query, all_project_summaries)
+
+        project_list = ', '.join(self.vector_store.get_project_names())
+        final_answer += f"\n\n---\n📚 Projects analyzed: {project_list}"
+        final_answer += f"\n📋 Mode: {self.mode}"
+        return final_answer
 
     def _hierarchical_merge(self, summaries: List[str], query: str) -> str:
         if not summaries:
@@ -1522,35 +1450,6 @@ Merged Summary:"""
             merged = self._merge_two_summaries(merged, summaries[i], query)
         return merged
 
-    def _direct_synthesis(self, query: str, project_summaries: List[str]) -> str:
-        combined = '\n\n'.join(project_summaries)
-        prompt = f"""Create a comprehensive final answer synthesizing insights from multiple projects.
-
-QUERY: {query}
-
-INSIGHTS FROM EACH PROJECT:
-{combined}
-
-Create a well-structured final answer that:
-1. Starts with a clear summary
-2. Organizes findings by project
-3. Highlights key patterns across projects
-4. Provides practical takeaways
-
-FINAL ANSWER:"""
-        try:
-            response = self.llm(
-                prompt,
-                max_tokens=600,
-                temperature=self.temperature,
-                top_p=self.top_p,
-                stop=["###", "---", "```"]
-            )
-            content = response['choices'][0]['text'].strip()
-            return content if content else "No final answer could be synthesized."
-        except Exception as e:
-            print(f"❌ Synthesis error: {e}")
-            return f"Error synthesizing answers: {str(e)}"
 
 
 class TokenAwareChunker:
@@ -1716,6 +1615,7 @@ class ProgressiveRAGChatThread(QThread):
                 self.batch_complete.emit(current_batch, total_batches)
 
             # Create the RAG engine with all settings
+
             rag = ProgressiveRAGEngine(
                 self.vector_store, self.llm,
                 temperature=self.settings.get('temperature', 0.7),
@@ -1724,11 +1624,17 @@ class ProgressiveRAGChatThread(QThread):
                 top_k=self.settings.get('top_k', 20),
                 process_all=self.settings.get('process_all', False),
                 batch_size=self.settings.get('batch_size', 5),
+                max_tokens=self.settings.get('max_tokens', 400),
+                list_output=self.settings.get('list_output', False),
+                list_tokens=self.settings.get('list_tokens', 150),
+                list_sentences=self.settings.get('list_sentences', 3),
+                list_temp=self.settings.get('list_temp', 0.6),
+                list_topp=self.settings.get('list_topp', 0.9),
+                sentence_threshold=self.settings.get('sentence_threshold', 0.5),
+                clustering_levels=self.settings.get('clustering_levels', 0),
+                top_k_clusters=self.settings.get('top_k_clusters', 5),
                 progress_callback=progress_callback,
-                batch_complete_callback=batch_complete_callback,  # PASS THIS
-                sentence_threshold = self.settings.get('sentence_threshold', 0.5),
-                clustering_levels = self.settings.get('clustering_levels', 0),
-                top_k_clusters = self.settings.get('top_k_clusters', 5)
+                batch_complete_callback=batch_complete_callback
             )
 
             # Pass contextual settings if available
@@ -1838,6 +1744,10 @@ class DataChatView(QWidget):
             'process_all': False
         }
 
+        # Table generator thread
+        self.table_thread = None
+        self.table_results = None
+
         self.setup_ui()
         self.load_projects()
         self.load_chat_sessions()
@@ -1851,7 +1761,7 @@ class DataChatView(QWidget):
         layout.setSpacing(2)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Progress bar
+        # === PROGRESS BAR ===
         progress_container = QWidget()
         progress_container.setStyleSheet("background-color: #f0f0f0; border: none; padding: 0px; margin: 0px;")
         progress_container.setFixedHeight(22)
@@ -1891,7 +1801,8 @@ class DataChatView(QWidget):
 
         layout.addWidget(progress_container)
 
-        # Top bar
+
+        # === TOP BAR ===
         top_bar = QHBoxLayout()
         top_bar.setSpacing(10)
         top_bar.setContentsMargins(5, 2, 5, 2)
@@ -1917,23 +1828,34 @@ class DataChatView(QWidget):
         top_bar.addStretch()
 
         # Controls
-
-        # Controls
         controls_group = QGroupBox("Processing Controls")
         controls_group.setStyleSheet("QGroupBox { border: none; padding: 0px; margin: 0px; }")
         controls_layout = QHBoxLayout(controls_group)
         controls_layout.setSpacing(6)
         controls_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Mode selector - NOW WITH ALL 4 MODES
+        # In the controls_group, after build_index_btn:
+        self.generate_table_btn = QPushButton("📊 Generate Table")
+        self.generate_table_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #E91E63;
+                color: white;
+                font-weight: bold;
+                padding: 3px 10px;
+                border-radius: 4px;
+                font-size: 10px;
+            }
+            QPushButton:hover { background-color: #C2185B; }
+        """)
+        self.generate_table_btn.clicked.connect(self.show_table_generator)
+        controls_layout.addWidget(self.generate_table_btn)
+        # Mode selector
         controls_layout.addWidget(QLabel("Mode:"))
         self.mode_combo = QComboBox()
         self.mode_combo.addItems([
             "Relevancy",
-            "Sequential",
             "Hierarchical",
-            "Contextual",
-            "Sentence Clustering"  # NEW
+            "Sentence Clustering"
         ])
         self.mode_combo.setStyleSheet("font-size: 11px; padding: 1px 4px;")
         self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
@@ -2032,9 +1954,11 @@ class DataChatView(QWidget):
         """)
         top_bar.addWidget(privacy_badge)
 
+
+
         layout.addLayout(top_bar)
 
-        # Main splitter
+        # === MAIN SPLITTER ===
         splitter = QSplitter(Qt.Horizontal)
         splitter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -2506,6 +2430,7 @@ class DataChatView(QWidget):
         )
 
     def send_message(self):
+        """Send a message with the current processing settings."""
         prompt = self.chat_input.toPlainText().strip()
         if not prompt:
             return
@@ -2537,6 +2462,7 @@ class DataChatView(QWidget):
         print("\n" + "=" * 60)
         print(f"🔍 QUERY: {prompt}")
         print(f"📋 Mode: {self.processing_settings.get('mode', 'Relevancy')}")
+        print(f"📋 List Output: {self.processing_settings.get('list_output', False)}")
         print("=" * 60 + "\n")
 
         self.progress_bar.setValue(0)
@@ -2550,10 +2476,17 @@ class DataChatView(QWidget):
             'top_k': self.processing_settings.get('top_k', 20),
             'process_all': self.processing_settings.get('process_all', False),
             'batch_size': self.processing_settings.get('batch_size', 5),
-            'max_tokens': self.processing_settings.get('max_tokens', 500),
-            'target_chunks': self.processing_settings.get('target_chunks', 10),
-            'temperature': 0.7,
-            'top_p': 0.9,
+            'max_tokens': self.processing_settings.get('max_tokens', 400),
+            'temperature': self.processing_settings.get('temperature', 0.7),
+            'top_p': self.processing_settings.get('top_p', 0.9),
+            'list_output': self.processing_settings.get('list_output', False),
+            'list_tokens': self.processing_settings.get('list_tokens', 150),
+            'list_sentences': self.processing_settings.get('list_sentences', 3),
+            'list_temp': self.processing_settings.get('list_temp', 0.6),
+            'list_topp': self.processing_settings.get('list_topp', 0.9),
+            'sentence_threshold': self.processing_settings.get('sentence_threshold', 0.5),
+            'clustering_levels': self.processing_settings.get('clustering_levels', 0),
+            'top_k_clusters': self.processing_settings.get('top_k_clusters', 5),
             'order': self.processing_settings.get('order', 'Most Relevant First'),
             'synthesis': self.processing_settings.get('synthesis', 'Contextual Linking'),
             'cluster_count': self.processing_settings.get('cluster_count', 3),
@@ -2567,9 +2500,9 @@ class DataChatView(QWidget):
             use_cache=True
         )
 
-        # Connect ALL signals (only the ones that exist)
+        # Connect signals
         self.chat_thread.progress_update.connect(self.update_batch_progress)
-        self.chat_thread.batch_complete.connect(self.on_batch_complete)  # Now this exists
+        self.chat_thread.batch_complete.connect(self.on_batch_complete)
         self.chat_thread.all_complete.connect(self.on_all_complete)
         self.chat_thread.response_received.connect(self.on_response_received)
         self.chat_thread.error_occurred.connect(self.on_error_occurred)
@@ -2577,7 +2510,6 @@ class DataChatView(QWidget):
         self.chat_thread.batch_summary.connect(self.append_batch_summary)
         self.chat_thread.project_summary.connect(self.append_project_summary)
 
-        # Start the thread
         self.chat_thread.start()
 
     def update_batch_progress(self, current_batch: int, total_batches: int, chunks_in_batch: int,
@@ -2595,6 +2527,7 @@ class DataChatView(QWidget):
         else:
             self.progress_bar.setValue(0)
             self.progress_label.setText("Processing...")
+        self.chat_display.repaint()
 
     def append_batch_summary(self, summary: str, project: str):
         """Append a batch summary to the chat display."""
@@ -2667,6 +2600,7 @@ class DataChatView(QWidget):
         self.chat_display.append(f"*{timestamp}*")
         self.chat_display.append("")
         self.chat_display.moveCursor(QTextCursor.End)
+        self.chat_display.repaint()
 
     def on_all_complete(self):
         """Called when all processing is complete."""
@@ -2727,6 +2661,7 @@ class DataChatView(QWidget):
 
         timestamp = datetime.now().strftime("%H:%M")
         self.add_message_to_chat('assistant', response, timestamp)
+        self.chat_display.repaint()
 
     def on_error_occurred(self, error):
         """Handle errors."""
@@ -2750,7 +2685,7 @@ class DataChatView(QWidget):
                 border-radius: 3px;
             }
         """))
-
+        self.chat_display.repaint()
         print(f"\n❌ ERROR: {error}")
 
     def load_chat_sessions(self):
@@ -3134,3 +3069,164 @@ class DataChatView(QWidget):
                 self.send_message()
                 return True
         return super().eventFilter(obj, event)
+
+    def show_table_generator(self):
+        """Open the table generator dialog."""
+        if not self.selected_projects:
+            QMessageBox.warning(self, "No Sources", "Please select sources first.")
+            return
+
+        if not self.is_vectorized:
+            QMessageBox.warning(self, "No Index", "Please build the vector index first.")
+            return
+
+        if not self.model_loaded:
+            QMessageBox.warning(self, "Model Not Loaded", "Please load the model first.")
+            return
+
+        # Show column setup dialog
+        dialog = ColumnSetupDialog(self)
+        if dialog.exec_() == QDialog.DialogCode.Accepted:
+            columns = dialog.get_columns()
+            if not columns:
+                QMessageBox.warning(self, "No Columns", "Please add at least one column.")
+                return
+
+            # Create progress dialog
+            self.progress_dialog = QProgressDialog("Generating table...", "Cancel", 0, len(columns), self)
+            self.progress_dialog.setWindowTitle("Processing")
+            self.progress_dialog.setModal(True)
+            self.progress_dialog.show()
+
+            # Generate the table
+            self._generate_table(columns)
+
+    def _generate_table(self, columns: List[ColumnDefinition]):
+        """Generate the table in a thread."""
+        self.table_thread = TableGenerationThread(
+            self.db, self.llm, self.selected_projects, columns
+        )
+        self.table_thread.progress_update.connect(self._on_table_progress)
+        self.table_thread.column_complete.connect(self._on_column_complete)
+        self.table_thread.generation_complete.connect(self._on_table_complete)
+        self.table_thread.error_occurred.connect(self._on_table_error)
+        self.table_thread.item_progress.connect(self._on_item_progress)  # NEW
+        self.table_thread.start()
+
+    def _on_item_progress(self, current: int, total: int):
+        """Update item-level progress."""
+        if self.progress_dialog:
+            self.progress_dialog.setValue(int((current / total) * 100))
+            self.progress_dialog.setLabelText(f"Generating item {current} of {total}...")
+
+    def _on_table_progress(self, message: str, current: int, total: int):
+        """Update progress dialog."""
+        if self.progress_dialog:
+            self.progress_dialog.setLabelText(message)
+            self.progress_dialog.setValue(current)
+
+    def _on_column_complete(self, col_index: int, results: List[Dict]):
+        """Handle column completion."""
+        print(f"✅ Column {col_index + 1} complete: {len(results)} items")
+
+    def _on_table_complete(self, results: List[List[Dict]]):
+        """Handle table generation complete."""
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+
+        # Show the table results dialog
+        self._show_table_results(results)
+
+    def _on_table_error(self, error: str):
+        """Handle table generation error."""
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+        QMessageBox.critical(self, "Error", f"Table generation failed:\n{error}")
+
+
+    def _show_table_results(self, results: List[List[Dict]]):
+        """Display the table results in a popup."""
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+
+        # Get column definitions from the thread
+        columns = self.table_thread.columns if self.table_thread else []
+
+        # Show results dialog
+        dialog = TableResultsDialog(results, columns, self)
+        dialog.exec_()
+
+    def _generate_item_batch(self, definition: ColumnDefinition, chunks: List[str]) -> List[Dict]:
+        """Generate multiple items in a single LLM call for efficiency."""
+        if not chunks:
+            return []
+
+        # Build batch prompt
+        items_text = []
+        for i, chunk in enumerate(chunks[:5]):  # Limit to 5 items per batch
+            items_text.append(f"ITEM {i + 1}:\n{chunk[:300]}...")
+
+        context = '\n\n'.join(items_text)
+
+        # Determine response format
+        if definition.response_type == ResponseType.SENTENCE:
+            min_words, max_words = definition.response_size.get('words', (2, 6))
+            format_instruction = f"For each item, provide a response in 1 sentence ({min_words}-{max_words} words)."
+        elif definition.response_type == ResponseType.PARAGRAPH:
+            min_sentences, max_sentences = definition.response_size.get('sentences', (3, 6))
+            format_instruction = f"For each item, provide a response in 1 paragraph ({min_sentences}-{max_sentences} sentences)."
+        else:
+            min_paragraphs, max_paragraphs = definition.response_size.get('paragraphs', (2, 4))
+            format_instruction = f"For each item, provide a response as an article ({min_paragraphs}-{max_paragraphs} paragraphs)."
+
+        # Build prompt
+        creativity = definition.creativity
+        if creativity < 0.3:
+            style = "Extract the information directly and literally."
+        elif creativity < 0.7:
+            style = "Summarize the information clearly and concisely."
+        else:
+            style = "Write in a creative, engaging, and expressive style."
+
+        prompt = f"""Based on the following items, {definition.request}:
+
+    {context}
+
+    {format_instruction}
+    {style}
+
+    For each item, provide the response on a new line starting with "ITEM X:".
+
+    RESPONSES:"""
+
+        try:
+            response = self.llm(
+                prompt,
+                max_tokens=len(chunks) * 200,  # Dynamic token limit
+                temperature=creativity,
+                top_p=0.9,
+                stop=["###", "---", "```"]
+            )
+            content = response['choices'][0]['text'].strip()
+
+            # Parse responses
+            results = []
+            import re
+            item_matches = re.findall(r'ITEM\s*(\d+):\s*(.+?)(?=ITEM\s*\d+:|$)', content, re.DOTALL)
+
+            for match in item_matches:
+                idx = int(match[0]) - 1
+                if idx < len(chunks):
+                    results.append({
+                        'item': match[1].strip(),
+                        'chunks': [chunks[idx]],
+                        'context': chunks[idx][:500] + '...' if len(chunks[idx]) > 500 else chunks[idx]
+                    })
+
+            return results
+        except Exception as e:
+            print(f"⚠️ Batch generation error: {e}")
+            return []

@@ -7,7 +7,7 @@ from .project_types import ProjectType
 
 
 class StudioDatabase:
-    """Unified database manager for all project types"""
+    """Unified database manager for all project types with container support"""
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -27,6 +27,7 @@ class StudioDatabase:
                 name TEXT NOT NULL,
                 project_type TEXT NOT NULL,
                 headline TEXT,
+                container_id INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 metadata TEXT,  -- JSON with type-specific config
@@ -35,12 +36,327 @@ class StudioDatabase:
             )
         ''')
 
+        # Containers table (NEW)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS containers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                parent_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (parent_id) REFERENCES containers(id) ON DELETE CASCADE
+            )
+        ''')
+
+        # Container order (for custom sorting within containers)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS container_order (
+                container_id INTEGER,
+                project_id INTEGER,
+                position INTEGER DEFAULT 0,
+                PRIMARY KEY (container_id, project_id),
+                FOREIGN KEY (container_id) REFERENCES containers(id) ON DELETE CASCADE,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+        ''')
+
+        # Add container_id column if it doesn't exist (for existing databases)
+        try:
+            cursor.execute('ALTER TABLE projects ADD COLUMN container_id INTEGER')
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         conn.commit()
         conn.close()
 
+    # In StudioDatabase class, add this method:
+
+    def _init_project_db(self, db_path: str, project_type: str, metadata: Dict = None):
+        """Initialize a project-specific database"""
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        if project_type == ProjectType.DATA_TABLE.value:
+            # Data Table project schema
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    _row_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    _row_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            # Add initial columns from metadata if provided
+            if metadata and 'column_config' in metadata:
+                for col_config in metadata['column_config']:
+                    col_name = col_config.get('name')
+                    col_type = col_config.get('type', 'text')
+                    if col_name:
+                        sqlite_type = self._get_sqlite_type(col_type)
+                        try:
+                            cursor.execute(f"ALTER TABLE data ADD COLUMN '{col_name}' {sqlite_type}")
+                        except sqlite3.OperationalError:
+                            pass  # Column might already exist
+
+        elif project_type == ProjectType.DATA_RESEARCH.value:
+            # Data Research project schema
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS pages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT UNIQUE,
+                    title TEXT,
+                    main_text TEXT,
+                    main_html TEXT,
+                    metadata TEXT,
+                    raw_html TEXT,
+                    content_hash TEXT,
+                    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            # Add FTS for search
+            cursor.execute('''
+                CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(
+                    title, main_text, content=pages
+                )
+            ''')
+            # Trigger to keep FTS in sync
+            cursor.execute('''
+                CREATE TRIGGER IF NOT EXISTS pages_fts_insert AFTER INSERT ON pages BEGIN
+                    INSERT INTO pages_fts(rowid, title, main_text)
+                    VALUES (new.id, new.title, new.main_text);
+                END
+            ''')
+            cursor.execute('''
+                CREATE TRIGGER IF NOT EXISTS pages_fts_update AFTER UPDATE ON pages BEGIN
+                    UPDATE pages_fts SET title = new.title, main_text = new.main_text
+                    WHERE rowid = new.id;
+                END
+            ''')
+            cursor.execute('''
+                CREATE TRIGGER IF NOT EXISTS pages_fts_delete AFTER DELETE ON pages BEGIN
+                    DELETE FROM pages_fts WHERE rowid = old.id;
+                END
+    ''')
+
+        elif project_type == ProjectType.DATA_DOCUMENT.value:
+            # Data Document project schema (similar to research but without URL uniqueness)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS pages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT,
+                    title TEXT,
+                    main_text TEXT,
+                    main_html TEXT,
+                    metadata TEXT,
+                    raw_html TEXT,
+                    content_hash TEXT,
+                    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+        elif project_type == ProjectType.DATA_CHAT.value:
+            # Data Chat project schema
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER,
+                    name TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    metadata TEXT
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER,
+                    role TEXT,
+                    content TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+        conn.commit()
+        conn.close()
+    # ========== CONTAINER METHODS ==========
+
+    def create_container(self, name: str, parent_id: Optional[int] = None) -> int:
+        """Create a new container"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            INSERT INTO containers (name, parent_id)
+            VALUES (?, ?)
+        ''', (name, parent_id))
+
+        container_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return container_id
+
+    def get_container(self, container_id: int) -> Optional[Dict]:
+        """Get container by ID"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT id, name, parent_id, created_at, updated_at
+            FROM containers WHERE id = ?
+        ''', (container_id,))
+
+        row = cursor.fetchone()
+        conn.close()
+
+        if row:
+            return {
+                'id': row[0],
+                'name': row[1],
+                'parent_id': row[2],
+                'created_at': row[3],
+                'updated_at': row[4]
+            }
+        return None
+
+    def get_container_tree(self) -> List[Dict]:
+        """Get nested container tree with projects"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Get all containers
+        cursor.execute('''
+            SELECT id, name, parent_id FROM containers
+            ORDER BY name
+        ''')
+        containers = cursor.fetchall()
+
+        # Get all projects
+        cursor.execute('''
+            SELECT id, name, project_type, headline, container_id
+            FROM projects WHERE is_active = 1
+            ORDER BY name
+        ''')
+        projects = cursor.fetchall()
+
+        conn.close()
+
+        # Build container map
+        container_map = {}
+        for c_id, name, parent_id in containers:
+            container_map[c_id] = {
+                'id': c_id,
+                'name': name,
+                'parent_id': parent_id,
+                'children': [],
+                'projects': []
+            }
+
+        # Build hierarchy
+        root_containers = []
+        for c_id, container in container_map.items():
+            if container['parent_id'] is None:
+                root_containers.append(container)
+            else:
+                parent = container_map.get(container['parent_id'])
+                if parent:
+                    parent['children'].append(container)
+
+        # Add projects to containers
+        for p_id, name, p_type, headline, container_id in projects:
+            project_data = {
+                'id': p_id,
+                'name': name,
+                'project_type': p_type,
+                'headline': headline or ''
+            }
+            if container_id and container_id in container_map:
+                container_map[container_id]['projects'].append(project_data)
+            else:
+                # Add to "Uncategorized" - we'll handle this separately
+                pass
+
+        return root_containers
+
+    def get_uncategorized_projects(self) -> List[Dict]:
+        """Get projects without a container"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT id, name, project_type, headline
+            FROM projects
+            WHERE container_id IS NULL AND is_active = 1
+            ORDER BY name
+        ''')
+
+        projects = []
+        for row in cursor.fetchall():
+            projects.append({
+                'id': row[0],
+                'name': row[1],
+                'project_type': row[2],
+                'headline': row[3] or ''
+            })
+
+        conn.close()
+        return projects
+
+    def move_to_container(self, project_id: int, container_id: Optional[int]):
+        """Move a project to a container (or remove from container)"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            UPDATE projects SET container_id = ? WHERE id = ?
+        ''', (container_id, project_id))
+
+        conn.commit()
+        conn.close()
+
+    def delete_container(self, container_id: int, move_to_parent: bool = True):
+        """Delete a container and optionally move projects to parent"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Get parent container ID
+        cursor.execute('SELECT parent_id FROM containers WHERE id = ?', (container_id,))
+        row = cursor.fetchone()
+        parent_id = row[0] if row else None
+
+        if move_to_parent:
+            # Move projects to parent container
+            cursor.execute('''
+                UPDATE projects SET container_id = ? WHERE container_id = ?
+            ''', (parent_id, container_id))
+        else:
+            # Set projects to uncategorized
+            cursor.execute('''
+                UPDATE projects SET container_id = NULL WHERE container_id = ?
+            ''', (container_id,))
+
+        # Delete the container
+        cursor.execute('DELETE FROM containers WHERE id = ?', (container_id,))
+
+        conn.commit()
+        conn.close()
+
+    def rename_container(self, container_id: int, new_name: str):
+        """Rename a container"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            UPDATE containers SET name = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        ''', (new_name, container_id))
+
+        conn.commit()
+        conn.close()
+
+    # ========== UPDATED PROJECT METHODS ==========
     def create_project(self, name: str, project_type: str, headline: str = "",
-                       metadata: Dict = None) -> int:
-        """Create a new project with its database"""
+                       metadata: Dict = None, container_id: Optional[int] = None) -> int:
+        """Create a new project with optional container"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
@@ -59,9 +375,9 @@ class StudioDatabase:
         self._init_project_db(data_path, project_type, metadata)
 
         cursor.execute('''
-            INSERT INTO projects (name, project_type, headline, metadata, data_path)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (name, project_type, headline, json.dumps(metadata or {}), data_path))
+            INSERT INTO projects (name, project_type, headline, metadata, data_path, container_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (name, project_type, headline, json.dumps(metadata or {}), data_path, container_id))
 
         project_id = cursor.lastrowid
         conn.commit()
@@ -69,69 +385,46 @@ class StudioDatabase:
 
         return project_id
 
-    def _init_project_db(self, db_path: str, project_type: str, metadata: Dict = None):
-        """Initialize a project-specific database"""
-        conn = sqlite3.connect(db_path)
+    def get_all_projects(self) -> List[Dict]:
+        """Get all projects with container info"""
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        if project_type == ProjectType.DATA_TABLE.value:
-            # Data Table project schema
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS data (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    _row_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    _row_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+        cursor.execute('''
+            SELECT id, name, project_type, headline, created_at, updated_at, metadata, data_path, container_id
+            FROM projects
+            WHERE is_active = 1
+            ORDER BY updated_at DESC
+        ''')
 
-        elif project_type == ProjectType.DATA_RESEARCH.value:
-            # Data Research project schema
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS pages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    url TEXT UNIQUE,
-                    title TEXT,
-                    main_text TEXT,
-                    main_html TEXT,
-                    metadata TEXT,
-                    raw_html TEXT,
-                    content_hash TEXT,
-                    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            # ... rest of research schema
+        projects = []
+        for row in cursor.fetchall():
+            projects.append({
+                'id': row[0],
+                'name': row[1],
+                'project_type': row[2],
+                'headline': row[3] or '',
+                'created_at': row[4],
+                'updated_at': row[5],
+                'metadata': json.loads(row[6]) if row[6] else {},
+                'data_path': row[7],
+                'container_id': row[8]
+            })
 
-        elif project_type == ProjectType.DATA_DOCUMENT.value:
-            # Data Document project schema - same as research but with document-specific metadata
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS pages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    url TEXT,
-                    title TEXT,
-                    main_text TEXT,
-                    main_html TEXT,
-                    metadata TEXT,
-                    raw_html TEXT,
-                    content_hash TEXT,
-                    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            # Remove UNIQUE constraint on url for documents
-
-        conn.commit()
         conn.close()
+        return projects
 
-    def get_all_projects(self) -> List[Dict]:
-        """Get all projects"""
+    def get_projects_by_container(self, container_id: int) -> List[Dict]:
+        """Get all projects in a specific container"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
         cursor.execute('''
             SELECT id, name, project_type, headline, created_at, updated_at, metadata, data_path
             FROM projects
-            WHERE is_active = 1
-            ORDER BY updated_at DESC
-        ''')
+            WHERE container_id = ? AND is_active = 1
+            ORDER BY name
+        ''', (container_id,))
 
         projects = []
         for row in cursor.fetchall():
@@ -150,12 +443,12 @@ class StudioDatabase:
         return projects
 
     def get_project(self, project_id: int) -> Optional[Dict]:
-        """Get a specific project"""
+        """Get a specific project with container info"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
         cursor.execute('''
-            SELECT id, name, project_type, headline, created_at, updated_at, metadata, data_path
+            SELECT id, name, project_type, headline, created_at, updated_at, metadata, data_path, container_id
             FROM projects
             WHERE id = ? AND is_active = 1
         ''', (project_id,))
@@ -172,7 +465,8 @@ class StudioDatabase:
                 'created_at': row[4],
                 'updated_at': row[5],
                 'metadata': json.loads(row[6]) if row[6] else {},
-                'data_path': row[7]
+                'data_path': row[7],
+                'container_id': row[8]
             }
         return None
 
@@ -510,8 +804,10 @@ class StudioDatabase:
         """Map column types to SQLite types"""
         type_map = {
             'text': 'TEXT',
+            'string': 'TEXT',
             'integer': 'INTEGER',
             'float': 'REAL',
+            'real': 'REAL',
             'category': 'TEXT',
             'image': 'TEXT',
             'video': 'TEXT',
@@ -521,7 +817,8 @@ class StudioDatabase:
             'email': 'TEXT',
             'date': 'TEXT',
             'datetime': 'TEXT',
-            'boolean': 'INTEGER'
+            'boolean': 'INTEGER',
+            'bool': 'INTEGER'
         }
         return type_map.get(column_type.lower(), 'TEXT')
 
@@ -646,24 +943,6 @@ class StudioDatabase:
 
             metadata['column_config'] = new_config
             self.update_project(project_id, metadata=metadata)
-
-    def get_table_column_names(self, data_path: str) -> List[str]:
-        """Get column names from a data table project in the correct order"""
-        if not os.path.exists(data_path):
-            return []
-
-        conn = sqlite3.connect(data_path)
-        cursor = conn.cursor()
-
-        try:
-            cursor.execute("PRAGMA table_info(data)")
-            columns = [col[1] for col in cursor.fetchall()
-                       if col[1] not in ['id', '_row_created_at', '_row_updated_at']]
-            conn.close()
-            return columns
-        except sqlite3.OperationalError:
-            conn.close()
-            return []
 
     def get_table_data(self, data_path: str) -> List[List]:
         """Get all data from a data table project"""
