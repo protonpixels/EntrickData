@@ -417,10 +417,30 @@ class CreateProjectDialog(QDialog):
             return {
                 'chat_sessions': {}
             }
-        elif project_type == ProjectType.DATA_SYNTHESIZER.value:  # NEW
+        elif project_type == ProjectType.DATA_SYNTHESIZER.value:
             return {
                 'extraction_pipelines': [],
-                'source_history': []
+                'source_history': [],
+                'synthesizer_state': {
+                    'columns': [
+                        {
+                            'name': 'Items',
+                            'request': 'Extract items',
+                            'response_type': 'sentence',
+                            'creativity': 0.5,
+                            'chunk_strategy': 'exact_match',
+                            'lookup_params': {'top_k': 10, 'previous_sentences': 1, 'following_sentences': 1,
+                                              'order': 'relevancy'},
+                            'source_type': 'project',
+                            'response_size': {'words': (2, 6)}
+                        }
+                    ],
+                    'rows': [],
+                    'selected_sources': [],
+                    'good_examples': [],
+                    'bad_examples': [],
+                    'ml_trained': False
+                }
             }
         return {}
 

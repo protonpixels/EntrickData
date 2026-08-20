@@ -180,7 +180,26 @@ class StudioDatabase:
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-
+        elif project_type == ProjectType.DATA_SYNTHESIZER.value:
+            # Data Synthesizer project schema (similar to data table but with columns for extraction)
+            cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS data (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        _row_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        _row_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+            # Add initial columns if provided in metadata
+            if metadata and 'column_config' in metadata:
+                for col_config in metadata['column_config']:
+                    col_name = col_config.get('name')
+                    col_type = col_config.get('type', 'text')
+                    if col_name:
+                        sqlite_type = self._get_sqlite_type(col_type)
+                        try:
+                            cursor.execute(f"ALTER TABLE data ADD COLUMN '{col_name}' {sqlite_type}")
+                        except sqlite3.OperationalError:
+                            pass  # Column might already exist
         conn.commit()
         conn.close()
     # ========== CONTAINER METHODS ==========

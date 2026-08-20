@@ -5,18 +5,21 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
     QSpinBox, QDoubleSpinBox, QLineEdit, QTextEdit, QDialog,
     QDialogButtonBox, QScrollArea, QFrame, QInputDialog,
-    QToolBar, QToolButton, QSizePolicy, QMenu, QAbstractItemView, QSlider
+    QToolBar, QToolButton, QSizePolicy, QMenu, QAbstractItemView, QSlider,
+
 )
 from PySide6.QtCore import Qt, Signal, QThread, QTimer
-from PySide6.QtGui import QAction, QColor, QBrush, QIcon
+from PySide6.QtGui import QAction, QColor, QBrush, QIcon, QKeySequence, QShortcut
 import re
-from typing import List, Dict, Optional
 
 from core.project_types import ProjectType
-from views.synthesizer_view.gradual_extraction_tab import GradualExtractionTab
 from views.synthesizer_view.pattern_rule_builder import PatternRuleBuilder
-from views.synthesizer_view.table_generator import ColumnDefinition, ResponseType, ChunkStrategy, SourceType
+from views.synthesizer_view.column_settings_panel import ColumnSettingsPanel
+from views.synthesizer_view.row_editor_panel import RowEditorPanel
 
+from typing import List
+
+from views.synthesizer_view.table_generator import ColumnDefinition
 
 class ColumnManagerDialog(QDialog):
     """Popup dialog for managing columns."""
@@ -133,8 +136,8 @@ class DataSynthesizerView(QWidget):
         self.selected_sources = []
         self.current_columns: List[ColumnDefinition] = []
         self.current_results = []
-        self.column_data = {}
-        self.review_items = []  # List of (item_text, confidence_score, is_edited)
+        self.rows = []  # List of dicts for Data Table
+        self.review_items = []
         self.good_examples = []
         self.bad_examples = []
         self.review_mode = True
@@ -142,7 +145,7 @@ class DataSynthesizerView(QWidget):
         self.ml_model = None
         self.confidence_threshold = 0.5
         self.top_k = 20
-        self.ml_results = []  # List of (item, confidence)
+        self.ml_results = []
 
         self.setup_ui()
         self.load_available_projects()
@@ -168,7 +171,7 @@ class DataSynthesizerView(QWidget):
         self.setLayout(layout)
 
     def _create_top_toolbar(self):
-        """Create the top toolbar with collapsible toggle."""
+        """Create the top toolbar."""
         toolbar = QToolBar()
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
@@ -213,7 +216,6 @@ class DataSynthesizerView(QWidget):
 
         toolbar.addSeparator()
 
-        # Back button
         back_btn = QToolButton()
         back_btn.setText("← Back")
         back_btn.clicked.connect(self.go_back)
@@ -229,7 +231,6 @@ class DataSynthesizerView(QWidget):
         """)
         toolbar.addWidget(back_btn)
 
-        # Project name
         name_label = QLabel(f"🧬 {self.project_data.get('name', 'Data Synthesizer')}")
         name_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #1c242e; padding: 2px 8px;")
         toolbar.addWidget(name_label)
@@ -252,7 +253,7 @@ class DataSynthesizerView(QWidget):
         """)
         toolbar.addWidget(manage_btn)
 
-        # Column dropdown (moved from tabs to here)
+        # Column dropdown
         toolbar.addWidget(QLabel("Column:"))
         self.column_dropdown = QComboBox()
         self.column_dropdown.setMaximumWidth(150)
@@ -262,7 +263,7 @@ class DataSynthesizerView(QWidget):
 
         toolbar.addSeparator()
 
-        # Confidence threshold (moved from preview tab)
+        # Confidence threshold
         toolbar.addWidget(QLabel("Conf:"))
         self.confidence_slider = QSlider(Qt.Horizontal)
         self.confidence_slider.setRange(0, 100)
@@ -309,17 +310,16 @@ class DataSynthesizerView(QWidget):
         """)
         toolbar.addWidget(view_bad_btn)
 
-        # Spacer
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         toolbar.addWidget(spacer)
 
-        # Status indicator
         self.status_indicator = QLabel("● Ready")
         self.status_indicator.setStyleSheet("color: #4CAF50; font-size: 10px; padding: 0px 4px;")
         toolbar.addWidget(self.status_indicator)
 
         return toolbar
+
     def _toggle_left_panel(self, checked):
         self.left_panel_visible = checked
         if checked:
@@ -391,6 +391,7 @@ class DataSynthesizerView(QWidget):
         return panel
 
     def _create_main_panel(self):
+        """Create the main content panel with tabs."""
         panel = QWidget()
         layout = QVBoxLayout()
         layout.setSpacing(0)
@@ -425,10 +426,349 @@ class DataSynthesizerView(QWidget):
         ai_tab = self._create_ai_tab()
         self.workflow_tabs.addTab(ai_tab, "✨ AI")
 
-        layout.addWidget(self.workflow_tabs)
+        data_table_tab = self._create_data_table_tab()
+        self.workflow_tabs.addTab(data_table_tab, "📋 Data Table")
 
+        layout.addWidget(self.workflow_tabs)
         panel.setLayout(layout)
         return panel
+
+
+    def _create_data_table_tab(self):
+        """Create the Data Table tab with table, search, and right panel."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(4)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        # Toolbar
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
+
+        # Search bar
+        toolbar.addWidget(QLabel("🔍"))
+        self.table_search = QLineEdit()
+        self.table_search.setPlaceholderText("Search...")
+        self.table_search.setMaximumWidth(200)
+        self.table_search.textChanged.connect(self._on_table_search)
+        toolbar.addWidget(self.table_search)
+
+        # Column filter
+        self.table_column_filter = QComboBox()
+        self.table_column_filter.setMaximumWidth(150)
+        self.table_column_filter.addItem("All Columns", None)
+        self.table_column_filter.currentIndexChanged.connect(self._on_table_search)
+        toolbar.addWidget(self.table_column_filter)
+
+        toolbar.addStretch()
+
+        # Select All button
+        self.select_all_btn = QPushButton("✅ Select All")
+        self.select_all_btn.clicked.connect(self._select_all_rows)
+        self.select_all_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 10px;
+            }
+            QPushButton:hover { background-color: #45a049; }
+        """)
+        toolbar.addWidget(self.select_all_btn)
+
+        # Deselect All button
+        self.deselect_all_btn = QPushButton("❌ Deselect All")
+        self.deselect_all_btn.clicked.connect(self._deselect_all_rows)
+        self.deselect_all_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #666;
+                color: white;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 10px;
+            }
+            QPushButton:hover { background-color: #555; }
+        """)
+        toolbar.addWidget(self.deselect_all_btn)
+
+        # Send to Preview button (initially hidden)
+        self.send_to_preview_btn = QPushButton("📤 Send to Preview")
+        self.send_to_preview_btn.clicked.connect(self._send_selected_to_preview)
+        self.send_to_preview_btn.setVisible(False)
+        self.send_to_preview_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 10px;
+            }
+            QPushButton:hover { background-color: #F57C00; }
+        """)
+        toolbar.addWidget(self.send_to_preview_btn)
+
+        # Toggle editor panel button
+        self.toggle_editor_btn = QPushButton("📝 Show Editor")
+        self.toggle_editor_btn.setCheckable(True)
+        self.toggle_editor_btn.setChecked(True)
+        self.toggle_editor_btn.clicked.connect(self._toggle_editor_panel)
+        self.toggle_editor_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #e0e0e0;
+                color: #666;
+                font-weight: bold;
+                padding: 4px 10px;
+                border-radius: 4px;
+                font-size: 11px;
+            }
+            QPushButton:checked {
+                background-color: #4CAF50;
+                color: white;
+            }
+        """)
+        toolbar.addWidget(self.toggle_editor_btn)
+
+        layout.addLayout(toolbar)
+
+        # Main splitter: table (left) and right panel (right)
+        splitter = QSplitter(Qt.Horizontal)
+
+        # Left: Table
+        table_widget = QWidget()
+        table_layout = QVBoxLayout(table_widget)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.data_table = QTableWidget()
+        self.data_table.setAlternatingRowColors(True)
+        self.data_table.setStyleSheet("""
+            QTableWidget {
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                font-size: 13px;
+            }
+            QHeaderView::section {
+                background-color: #f5f7fa;
+                padding: 6px;
+                font-weight: 600;
+            }
+        """)
+        self.data_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.data_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.data_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.data_table.itemSelectionChanged.connect(self._on_table_selection_changed)
+        self.data_table.horizontalHeader().sectionClicked.connect(self._on_column_header_clicked)
+        table_layout.addWidget(self.data_table)
+
+        splitter.addWidget(table_widget)
+
+        # Right: Editor Panel
+        self.editor_panel = QWidget()
+        editor_layout = QVBoxLayout(self.editor_panel)
+        editor_layout.setSpacing(0)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+
+        editor_tabs = QTabWidget()
+        editor_tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #ddd;
+                background: white;
+            }
+            QTabBar::tab {
+                padding: 4px 12px;
+                font-size: 12px;
+            }
+        """)
+
+        # Column Settings tab
+        self.column_settings_panel = ColumnSettingsPanel()
+        self.column_settings_panel.settings_changed.connect(self._on_column_settings_changed)
+        self.column_settings_panel.category_selected.connect(self._on_category_selected)
+        editor_tabs.addTab(self.column_settings_panel, "Column Settings")
+
+        # Row Editor tab
+        self.row_editor_panel = RowEditorPanel()
+        self.row_editor_panel.row_added.connect(self._add_row)
+        self.row_editor_panel.row_updated.connect(self._update_row)
+        self.row_editor_panel.row_deleted.connect(self._delete_row)
+        editor_tabs.addTab(self.row_editor_panel, "Row Editor")
+
+        editor_layout.addWidget(editor_tabs)
+
+        splitter.addWidget(self.editor_panel)
+        splitter.setSizes([600, 400])
+
+        layout.addWidget(splitter)
+
+        # Keyboard shortcuts
+        self._setup_table_shortcuts()
+
+        return tab
+
+    def _setup_table_shortcuts(self):
+        """Setup keyboard shortcuts for the data table."""
+        # Ctrl+A to select all
+        select_all_shortcut = QShortcut(QKeySequence("Ctrl+A"), self.data_table)
+        select_all_shortcut.activated.connect(self._select_all_rows)
+
+        # Delete key to delete selected rows
+        delete_shortcut = QShortcut(QKeySequence("Delete"), self.data_table)
+        delete_shortcut.activated.connect(self._delete_selected_rows)
+
+    def _select_all_rows(self):
+        """Select all rows in the table."""
+        self.data_table.selectAll()
+        self._update_selection_buttons()
+
+    def _deselect_all_rows(self):
+        """Deselect all rows."""
+        self.data_table.clearSelection()
+        self._update_selection_buttons()
+
+    def _delete_selected_rows(self):
+        """Delete all selected rows."""
+        selected_rows = set()
+        for item in self.data_table.selectedItems():
+            selected_rows.add(item.row())
+
+        if not selected_rows:
+            return
+
+        count = len(selected_rows)
+        reply = QMessageBox.question(
+            self,
+            "Delete Rows",
+            f"Delete {count} selected row(s)?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            # Delete in reverse order to maintain indices
+            for row_idx in sorted(selected_rows, reverse=True):
+                if row_idx < len(self.rows):
+                    # Remove from Good examples if present
+                    row_data = self.rows[row_idx]
+                    for col in self.current_columns:
+                        val = row_data.get(col.name)
+                        if val in self.good_examples:
+                            self.good_examples.remove(val)
+                    del self.rows[row_idx]
+
+            self._update_data_table()
+            self._save_synthesizer_state()
+            self.row_editor_panel.clear()
+            self._update_selection_buttons()
+
+    def _send_selected_to_preview(self):
+        """Send selected rows to the Preview tab for review."""
+        selected_rows = set()
+        for item in self.data_table.selectedItems():
+            selected_rows.add(item.row())
+
+        if not selected_rows:
+            return
+
+        # Get the items from selected rows
+        items = []
+        for row_idx in selected_rows:
+            if row_idx < len(self.rows):
+                # Get the first column's value as the item
+                row = self.rows[row_idx]
+                # Use the first column's value
+                first_col = self.current_columns[0].name if self.current_columns else None
+                if first_col and first_col in row:
+                    items.append(row[first_col])
+
+        if items:
+            self._add_to_review(items)
+            self.workflow_tabs.setCurrentIndex(0)  # Switch to Preview tab
+            QMessageBox.information(
+                self,
+                "Sent to Preview",
+                f"Sent {len(items)} items to the Preview tab for review."
+            )
+
+    def _update_selection_buttons(self):
+        """Update the visibility of selection buttons."""
+        selected = len(self.data_table.selectedItems()) > 0
+        self.send_to_preview_btn.setVisible(selected)
+
+    def _on_table_selection_changed(self):
+        """Handle table selection changes."""
+        self._update_selection_buttons()
+
+        # Get selected rows
+        selected = self.data_table.selectedItems()
+        if not selected:
+            self.row_editor_panel.clear()
+            return
+
+        # Get the first selected row
+        row = selected[0].row()
+
+        # Get the row data
+        item = self.data_table.item(row, 0)
+        if item:
+            row_data = item.data(Qt.UserRole)
+            if row_data:
+                self.row_editor_panel.load_row(row, row_data)
+                self._load_active_column_value(row_data)
+                return
+
+        # Fallback: build row data from all columns
+        row_data = {}
+        for j, col in enumerate(self.current_columns):
+            cell_item = self.data_table.item(row, j)
+            if cell_item:
+                row_data[col.name] = cell_item.text()
+        self.row_editor_panel.load_row(row, row_data)
+        self._load_active_column_value(row_data)
+
+    def _load_active_column_value(self, row_data):
+        """Load the active column's value into the row editor's active field."""
+        # Get the currently selected column from the dropdown
+        col_index = self.column_dropdown.currentIndex()
+        if col_index < 0 or col_index >= len(self.current_columns):
+            return
+
+        col = self.current_columns[col_index]
+        value = row_data.get(col.name, '')
+
+        # Find the input widget for this column in the row editor
+        widget = self.row_editor_panel.input_widgets.get(col.name)
+        if not widget:
+            return
+
+        # Set the value based on widget type
+        if isinstance(widget, QLineEdit):
+            widget.setText(str(value))
+        elif isinstance(widget, QTextEdit):
+            widget.setPlainText(str(value))
+        elif isinstance(widget, QComboBox):
+            idx = widget.findText(str(value))
+            if idx >= 0:
+                widget.setCurrentIndex(idx)
+            else:
+                widget.setEditText(str(value))
+        elif isinstance(widget, QListWidget):
+            # For multiple selection, value might be a list or comma-separated string
+            if isinstance(value, list):
+                selected_texts = value
+            else:
+                selected_texts = [v.strip() for v in str(value).split(',') if v.strip()]
+            widget.clearSelection()
+            for i in range(widget.count()):
+                item = widget.item(i)
+                if item.text() in selected_texts:
+                    item.setSelected(True)
+        elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+            try:
+                if value:
+                    widget.setValue(float(value))
+                else:
+                    widget.setValue(widget.minimum())
+            except (ValueError, TypeError):
+                widget.setValue(widget.minimum())
 
     def _create_preview_tab(self):
         """Create the Preview/Review tab with simplified toolbar."""
@@ -901,18 +1241,26 @@ class DataSynthesizerView(QWidget):
         return tab
     # ========== COLUMN MANAGEMENT ==========
 
+
     def _show_column_manager(self):
+        """Show the column manager dialog."""
         dialog = ColumnManagerDialog(self.current_columns, self)
         if dialog.exec_() == QDialog.DialogCode.Accepted:
             self._update_column_dropdowns()
-            self._update_preview()
+            self._update_data_table()
+            self._update_column_filter()
+            self.row_editor_panel.set_columns(self.current_columns)
             self._save_synthesizer_state()
 
+            # Update the column settings panel
+            if self.current_columns:
+                self.column_settings_panel.load_column(self.current_columns[0], 0)
+                self.column_dropdown.setCurrentIndex(0)
+
     def _update_column_dropdowns(self):
-        """Update the column dropdown (only one now)."""
+        """Update the column dropdown."""
         names = [col.name for col in self.current_columns]
 
-        # Only update the main column dropdown
         self.column_dropdown.blockSignals(True)
         self.column_dropdown.clear()
         self.column_dropdown.addItems(names)
@@ -920,15 +1268,42 @@ class DataSynthesizerView(QWidget):
             self.column_dropdown.setCurrentIndex(0)
         self.column_dropdown.blockSignals(False)
 
-        # Update preview with new column
-        self._update_preview()
+        # Update row editor columns
+        self.row_editor_panel.set_columns(self.current_columns)
 
     def _on_column_changed(self, index):
         """Handle column dropdown change."""
         if index >= 0 and index < len(self.current_columns):
             col = self.current_columns[index]
-            self.current_results = self.column_data.get(col.name, [])
-            self._update_preview()
+            # Load the column settings
+            self.column_settings_panel.load_column(col, index)
+
+            # Also update the row editor to show the selected column's value
+            # if there's a selected row
+            selected = self.data_table.selectedItems()
+            if len(selected) == 1:
+                row = selected[0].row()
+                item = self.data_table.item(row, 0)
+                if item:
+                    row_data = item.data(Qt.UserRole)
+                    if row_data:
+                        self._load_active_column_value(row_data)
+
+            # Force the splitter to maintain its sizes
+            # Get the current sizes before any layout changes
+            splitter = self.findChild(QSplitter)
+            if splitter:
+                # Temporarily block signals to prevent recursive updates
+                splitter.blockSignals(True)
+                # Store current sizes
+                sizes = splitter.sizes()
+                # Ensure the right panel is still visible
+                if self.editor_panel.isVisible():
+                    # If the right panel is visible, make sure it has a reasonable size
+                    if len(sizes) == 2 and sizes[1] < 50:
+                        sizes[1] = 400
+                        splitter.setSizes(sizes)
+                splitter.blockSignals(False)
 
     def _update_pattern_column(self, index):
         pass
@@ -968,7 +1343,12 @@ class DataSynthesizerView(QWidget):
         if self.review_mode and self.review_items:
             display_items = self._filter_review_items()
         else:
-            display_items = self.column_data.get(column_name, [])
+            # Get items from rows for this column
+            display_items = []
+            for row in self.rows:
+                val = row.get(column_name, '')
+                if val:
+                    display_items.append(val)
             # If we have ML results with confidence, show them
             if self.ml_results:
                 display_items = self._filter_ml_results()
@@ -997,15 +1377,12 @@ class DataSynthesizerView(QWidget):
                 item_text = item_data
                 confidence_val = None
 
-            col_idx = 0
-
             if self.review_mode and self.review_items:
                 # Checkbox
                 check_item = QTableWidgetItem()
                 check_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
                 check_item.setCheckState(Qt.Checked)
                 self.preview_table.setItem(i, 0, check_item)
-                col_idx = 1
 
                 # Confidence score
                 if confidence_val is not None:
@@ -1019,15 +1396,14 @@ class DataSynthesizerView(QWidget):
                     self.preview_table.setItem(i, 1, conf_item)
                 else:
                     self.preview_table.setItem(i, 1, QTableWidgetItem("N/A"))
-                col_idx = 2
 
                 # Item text (editable)
                 text_item = QTableWidgetItem(item_text)
                 text_item.setFlags(text_item.flags() | Qt.ItemIsEditable)
+                self.preview_table.setItem(i, 2, text_item)
 
-                # Check if this item was edited
+                # Edit indicator
                 if isinstance(item_data, tuple) and len(item_data) == 3 and item_data[2]:
-                    text_item.setBackground(QBrush(QColor(200, 220, 255)))
                     edit_indicator = QTableWidgetItem("✎ Edited")
                     edit_indicator.setFlags(Qt.ItemIsEnabled)
                     edit_indicator.setTextAlignment(Qt.AlignCenter)
@@ -1038,8 +1414,6 @@ class DataSynthesizerView(QWidget):
                     edit_item.setFlags(Qt.ItemIsEnabled)
                     edit_item.setTextAlignment(Qt.AlignCenter)
                     self.preview_table.setItem(i, 3, edit_item)
-
-                self.preview_table.setItem(i, 2, text_item)
 
             elif self.ml_results and not self.review_mode:
                 if confidence_val is not None:
@@ -1062,8 +1436,8 @@ class DataSynthesizerView(QWidget):
                 self.preview_table.setItem(i, 0, text_item)
 
         # Resize columns
-        for col in range(self.preview_table.columnCount()):
-            self.preview_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        for c in range(self.preview_table.columnCount()):
+            self.preview_table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
         if self.preview_table.columnCount() > 0:
             self.preview_table.horizontalHeader().setSectionResizeMode(
                 self.preview_table.columnCount() - 1, QHeaderView.Stretch
@@ -1181,7 +1555,12 @@ class DataSynthesizerView(QWidget):
         elif self.ml_results:
             display_items = self._filter_ml_results()
         else:
-            display_items = self.column_data.get(col.name, [])
+            # Get items from rows for this column
+            display_items = []
+            for row in self.rows:
+                val = row.get(col.name, '')
+                if val:
+                    display_items.append(val)
 
         added_to_column = 0
         added_to_good = 0
@@ -1194,7 +1573,6 @@ class DataSynthesizerView(QWidget):
                 # Get the text (might be edited)
                 if isinstance(item_data, tuple):
                     item_text = item_data[0]
-                    # Check if this was edited
                     if len(item_data) == 3 and item_data[2]:  # Edited flag
                         edited_items.append(item_text)
                 else:
@@ -1208,12 +1586,19 @@ class DataSynthesizerView(QWidget):
                     self.good_examples.append(item_text)
                     added_to_good += 1
 
-                # Auto-add to column if not already there
-                if col.name not in self.column_data:
-                    self.column_data[col.name] = []
+                # Auto-add to column (rows) if not already there
+                # Check if this value already exists in any row for this column
+                exists = False
+                for existing_row in self.rows:
+                    if existing_row.get(col.name) == item_text:
+                        exists = True
+                        break
 
-                if item_text not in self.column_data[col.name]:
-                    self.column_data[col.name].append(item_text)
+                if not exists:
+                    # Add a new row with this value
+                    new_row = {c.name: '' for c in self.current_columns}
+                    new_row[col.name] = item_text
+                    self.rows.append(new_row)
                     added_to_column += 1
 
         # Remove from review items if they were in review
@@ -1232,6 +1617,7 @@ class DataSynthesizerView(QWidget):
 
         self._update_counts()
         self._update_preview()
+        self._update_data_table()  # Update the data table view too
         self._save_synthesizer_state()
 
         # Enable train button if we have both good and bad
@@ -1540,7 +1926,12 @@ class DataSynthesizerView(QWidget):
         elif self.ml_results:
             display_items = self._filter_ml_results()
         else:
-            display_items = self.column_data.get(col.name, [])
+            # Get items from rows for this column
+            display_items = []
+            for row in self.rows:
+                val = row.get(col.name, '')
+                if val:
+                    display_items.append(val)
 
         added = 0
         for row in rows:
@@ -1566,9 +1957,10 @@ class DataSynthesizerView(QWidget):
     def _update_counts(self):
         """Update all count labels."""
         # Preview tab counts
-        self.good_bad_count_label.setText(f"✅ Good: {len(self.good_examples)} | ❌ Bad: {len(self.bad_examples)}")
+        if hasattr(self, 'good_bad_count_label'):
+            self.good_bad_count_label.setText(f"✅ Good: {len(self.good_examples)} | ❌ Bad: {len(self.bad_examples)}")
 
-        # ML tab counts (if they exist)
+        # ML tab counts
         if hasattr(self, 'good_count_label'):
             self.good_count_label.setText(f"✅ Good: {len(self.good_examples)}")
         if hasattr(self, 'bad_count_label'):
@@ -1578,6 +1970,7 @@ class DataSynthesizerView(QWidget):
         if hasattr(self, 'train_ml_btn'):
             if len(self.good_examples) >= 2 and len(self.bad_examples) >= 2:
                 self.train_ml_btn.setEnabled(True)
+
     def _commit_review(self):
         """Commit selected review items to the column with edits preserved."""
         col_index = self.column_dropdown.currentIndex()
@@ -1590,9 +1983,8 @@ class DataSynthesizerView(QWidget):
         for i in range(self.preview_table.rowCount()):
             check_item = self.preview_table.item(i, 0)
             if check_item and check_item.checkState() == Qt.Checked:
-                # Get the text from the item column (which may have been edited)
                 if self.review_mode:
-                    text_item = self.preview_table.item(i, 2)  # Item column
+                    text_item = self.preview_table.item(i, 2)
                 else:
                     text_item = self.preview_table.item(i, 0)
                 if text_item:
@@ -1601,30 +1993,37 @@ class DataSynthesizerView(QWidget):
         if not selected:
             return
 
-        if col.name not in self.column_data:
-            self.column_data[col.name] = []
+        # Add to rows
+        added_count = 0
+        for item_text in selected:
+            # Check if this value already exists
+            exists = False
+            for row in self.rows:
+                if row.get(col.name) == item_text:
+                    exists = True
+                    break
 
-        # Add only items not already in the column
-        new_items = []
-        for item in selected:
-            if item not in self.column_data[col.name]:
-                new_items.append(item)
-
-        if new_items:
-            self.column_data[col.name].extend(new_items)
+            if not exists:
+                new_row = {c.name: '' for c in self.current_columns}
+                new_row[col.name] = item_text
+                self.rows.append(new_row)
+                added_count += 1
 
         # Remove committed items from review
         self.review_items = []
         self.ml_results = []
         self._update_preview()
+        self._update_data_table()
         self._save_synthesizer_state()
 
         QMessageBox.information(
             self,
             "Commit Complete",
-            f"Added {len(new_items)} new items to column '{col.name}'.\n"
-            f"({len(selected) - len(new_items)} were already in the column)"
+            f"Added {added_count} new items to column '{col.name}'.\n"
+            f"({len(selected) - added_count} were already in the column)"
         )
+
+
     def _clear_review(self):
         reply = QMessageBox.question(
             self,
@@ -2296,10 +2695,11 @@ class DataSynthesizerView(QWidget):
         return ids
 
     # ========== SAVE / LOAD ==========
-
     def _save_synthesizer_state(self):
+        """Save the synthesizer state to project metadata."""
         import json
 
+        # Save columns as dicts
         columns_data = []
         for col in self.current_columns:
             columns_data.append({
@@ -2310,29 +2710,60 @@ class DataSynthesizerView(QWidget):
                 'chunk_strategy': col.chunk_strategy.value if hasattr(col.chunk_strategy, 'value') else 'exact_match',
                 'lookup_params': col.lookup_params,
                 'source_type': col.source_type.value if hasattr(col.source_type, 'value') else 'project',
-                'response_size': col.response_size
+                'response_size': col.response_size,
+                # Data Table settings
+                'data_type': getattr(col, 'data_type', 'text'),
+                'required': getattr(col, 'required', False),
+                'unique': getattr(col, 'unique', False),
+                'category_mode': getattr(col, 'category_mode', 'single'),
+                'categories': getattr(col, 'categories', []),
+                'min_value': getattr(col, 'min_value', None),
+                'max_value': getattr(col, 'max_value', None),
+                'step': getattr(col, 'step', None),
+                'file_path_mode': getattr(col, 'file_path_mode', 'filename'),
             })
 
-        column_data_dict = {k: v for k, v in self.column_data.items()}
-
+        # Save selected sources
         selected_sources = []
         for i in range(self.source_list.count()):
             if self.source_list.item(i).checkState() == Qt.Checked:
                 selected_sources.append(self.source_list.item(i).data(Qt.UserRole))
 
-        self.metadata['synthesizer_state'] = {
+        # Save all state - NO self.column_data here
+        state = {
             'columns': columns_data,
-            'column_data': column_data_dict,
+            'rows': self.rows,
             'selected_sources': selected_sources,
             'good_examples': self.good_examples,
             'bad_examples': self.bad_examples,
-            'ml_trained': self.ml_trained
+            'ml_trained': self.ml_trained,
+            'ml_model_id': self.ml_model_id,
+            # Keep for backward compatibility with old versions
+            'column_data': self._convert_rows_to_column_data(),
         }
 
+        self.metadata['synthesizer_state'] = state
         self.db.update_project(self.project_id, metadata=self.metadata)
         self.update_status("State saved")
 
+
+    def _convert_rows_to_column_data(self):
+        """Convert rows to column_data dict for backward compatibility."""
+        if not self.rows or not self.current_columns:
+            return {}
+
+        column_data = {col.name: [] for col in self.current_columns}
+        for row in self.rows:
+            for col in self.current_columns:
+                value = row.get(col.name, '')
+                if isinstance(value, list):
+                    value = ', '.join(str(v) for v in value)
+                column_data[col.name].append(value)
+
+        return column_data
+
     def load_synthesizer_state(self):
+        """Load synthesizer state from project metadata."""
         state = self.metadata.get('synthesizer_state', {})
 
         if not state:
@@ -2353,9 +2784,11 @@ class DataSynthesizerView(QWidget):
                 self.current_columns.append(default_col)
 
             self._update_column_dropdowns()
-            self._update_preview()
+            self._update_data_table()
+            self._update_column_filter()
             return
 
+        # Load Columns
         from views.synthesizer_view.table_generator import ColumnDefinition, ResponseType, ChunkStrategy, SourceType
 
         response_type_map = {
@@ -2390,33 +2823,79 @@ class DataSynthesizerView(QWidget):
                 source_type=source_type_map.get(col_data.get('source_type', 'project'), SourceType.PROJECT),
                 response_size=col_data.get('response_size', {'words': (2, 6)})
             )
+
+            # Data Table settings
+            col.data_type = col_data.get('data_type', 'text')
+            col.required = col_data.get('required', False)
+            col.unique = col_data.get('unique', False)
+            col.category_mode = col_data.get('category_mode', 'single')
+            col.categories = col_data.get('categories', [])
+            col.min_value = col_data.get('min_value', None)
+            col.max_value = col_data.get('max_value', None)
+            col.step = col_data.get('step', None)
+            col.file_path_mode = col_data.get('file_path_mode', 'filename')
+
             self.current_columns.append(col)
 
-        self.column_data = state.get('column_data', {})
+        # Load Rows
+        rows = state.get('rows', [])
+        if rows:
+            self.rows = rows
+        else:
+            column_data = state.get('column_data', {})
+            if column_data:
+                self.rows = self._convert_column_data_to_rows(column_data)
+            else:
+                self.rows = []
 
+        # Load selected sources
         selected_sources = state.get('selected_sources', [])
         for i in range(self.source_list.count()):
             source_id = self.source_list.item(i).data(Qt.UserRole)
             if source_id in selected_sources:
                 self.source_list.item(i).setCheckState(Qt.Checked)
 
+        # Load examples and ML state
         self.good_examples = state.get('good_examples', [])
         self.bad_examples = state.get('bad_examples', [])
         self.ml_trained = state.get('ml_trained', False)
+        self.ml_model_id = state.get('ml_model_id', None)
 
+        # Update UI
         self._update_column_dropdowns()
-        self._update_preview()
+        self._update_data_table()
+        self._update_column_filter()
         self.update_source_count()
-        self.good_count_label.setText(f"✅ Good: {len(self.good_examples)}")
-        self.bad_count_label.setText(f"❌ Bad: {len(self.bad_examples)}")
-        self.good_bad_count_label.setText(f"✅ Good: {len(self.good_examples)} | ❌ Bad: {len(self.bad_examples)}")
 
+        # Update counts
+        self._update_counts()
+
+        # Enable train button if enough examples
         if len(self.good_examples) >= 2 and len(self.bad_examples) >= 2:
             self.train_ml_btn.setEnabled(True)
             if self.ml_trained:
                 self.ml_status_label.setText("✅ Trained")
                 self.ml_status_label.setStyleSheet("color: #4CAF50; font-size: 11px;")
                 self.scan_ml_btn.setEnabled(True)
+
+    def _convert_column_data_to_rows(self, column_data: dict) -> List[dict]:
+        """Convert column_data dict to rows list."""
+        if not column_data:
+            return []
+
+        max_rows = max([len(values) for values in column_data.values()]) if column_data else 0
+        if max_rows == 0:
+            return []
+
+        rows = []
+        for i in range(max_rows):
+            row = {}
+            for col_name, values in column_data.items():
+                row[col_name] = values[i] if i < len(values) else ''
+            rows.append(row)
+
+        return rows
+
 
     def load_saved_pipelines(self):
         pipelines = self.metadata.get('extraction_pipelines', [])
@@ -2529,7 +3008,12 @@ class DataSynthesizerView(QWidget):
             display_items = self._filter_review_items()
             is_review_mode = True
         else:
-            display_items = self.column_data.get(col.name, [])
+            # Get items from rows for this column
+            display_items = []
+            for row in self.rows:
+                val = row.get(col.name, '')
+                if val:
+                    display_items.append(val)
             is_review_mode = False
 
         # Get items to delete
@@ -2561,10 +3045,12 @@ class DataSynthesizerView(QWidget):
                 self.review_items = [item for item in self.review_items
                                      if (item[0] if isinstance(item, tuple) else item) not in items_to_delete]
             else:
-                # Remove from column data
-                if col.name in self.column_data:
-                    self.column_data[col.name] = [item for item in self.column_data[col.name]
-                                                  if item not in items_to_delete]
+                # Remove from rows
+                for item_text in items_to_delete:
+                    for i, row in enumerate(self.rows):
+                        if row.get(col.name) == item_text:
+                            del self.rows[i]
+                            break
 
             # Also remove from good/bad examples
             self.good_examples = [item for item in self.good_examples if item not in items_to_delete]
@@ -2576,6 +3062,7 @@ class DataSynthesizerView(QWidget):
 
             self._update_counts()
             self._update_preview()
+            self._update_data_table()
             self._save_synthesizer_state()
 
             self.update_status(f"🗑️ Deleted {len(items_to_delete)} items")
@@ -2699,3 +3186,315 @@ class DataSynthesizerView(QWidget):
                 "Examples Added",
                 f"❌ Added {len(new_items)} items to Bad examples"
             )
+
+    def _on_column_settings_changed(self):
+        """Apply column settings to the current column."""
+        if self.column_settings_panel.current_column_index < 0:
+            return
+
+        idx = self.column_settings_panel.current_column_index
+        settings = self.column_settings_panel.get_column_settings()
+        col = self.current_columns[idx]
+
+        # Update column attributes
+        for key, value in settings.items():
+            setattr(col, key, value)
+
+        # Update the table
+        self._update_data_table()
+        self._update_column_filter()
+
+        # REBUILD the row editor with the new column settings
+        self.row_editor_panel.set_columns(self.current_columns)
+
+        # If there's a selected row, reload it
+        selected = self.data_table.selectedItems()
+        if len(selected) == 1:
+            row = selected[0].row()
+            item = self.data_table.item(row, 0)
+            if item:
+                row_data = item.data(Qt.UserRole)
+                if row_data:
+                    self.row_editor_panel.load_row(row, row_data)
+                    self._load_active_column_value(row_data)
+
+        self._save_synthesizer_state()
+
+    def _on_category_selected(self, category):
+        """Insert selected category into the row editor's current field."""
+        # Find the category column and set its value in the row editor
+        for col_name, widget in self.row_editor_panel.input_widgets.items():
+            col_def = next((c for c in self.current_columns if c.name == col_name and c.data_type == 'category'), None)
+            if col_def:
+                if isinstance(widget, QComboBox):
+                    widget.setCurrentText(category)
+                elif isinstance(widget, QListWidget):
+                    for i in range(widget.count()):
+                        if widget.item(i).text() == category:
+                            widget.item(i).setSelected(not widget.item(i).isSelected())
+                break
+
+    def _load_column_settings(self):
+        """Load the selected column's settings into the column settings panel."""
+        # We need to know which column is currently selected. We'll use the column filter's current index.
+        # Alternatively, we can allow clicking on column headers.
+        # For simplicity, we can use the first column or a dropdown.
+        # We'll add a dropdown in the column settings panel itself.
+        pass
+
+    def _on_column_header_clicked(self, index):
+        """When a column header is clicked, load that column's settings."""
+        if index < 0 or index >= len(self.current_columns):
+            return
+
+        col = self.current_columns[index]
+        self.column_settings_panel.load_column(col, index)
+        # Also update the column dropdown
+        self.column_dropdown.setCurrentIndex(index)
+
+    def _create_column_from_definition(self, col_data: dict) -> ColumnDefinition:
+        """Create a ColumnDefinition from saved data."""
+        from views.synthesizer_view.table_generator import ColumnDefinition, ResponseType, ChunkStrategy, SourceType
+
+        response_type_map = {
+            'sentence': ResponseType.SENTENCE,
+            'paragraph': ResponseType.PARAGRAPH,
+            'article': ResponseType.ARTICLE
+        }
+        chunk_strategy_map = {
+            'exact_match': ChunkStrategy.EXACT_MATCH,
+            'semantic_match': ChunkStrategy.SEMANTIC_MATCH,
+            'max_semantic': ChunkStrategy.MAX_SEMANTIC
+        }
+        source_type_map = {
+            'project': SourceType.PROJECT,
+            'previous_column_data': SourceType.PREVIOUS_COLUMN_DATA,
+            'previous_column_chunks': SourceType.PREVIOUS_COLUMN_CHUNKS
+        }
+
+        col = ColumnDefinition(
+            name=col_data.get('name', ''),
+            request=col_data.get('request', ''),
+            response_type=response_type_map.get(col_data.get('response_type', 'sentence'), ResponseType.SENTENCE),
+            creativity=col_data.get('creativity', 0.5),
+            chunk_strategy=chunk_strategy_map.get(col_data.get('chunk_strategy', 'exact_match'),
+                                                  ChunkStrategy.EXACT_MATCH),
+            lookup_params=col_data.get('lookup_params', {'top_k': 10, 'previous_sentences': 1, 'following_sentences': 1,
+                                                         'order': 'relevancy'}),
+            source_type=source_type_map.get(col_data.get('source_type', 'project'), SourceType.PROJECT),
+            response_size=col_data.get('response_size', {'words': (2, 6)})
+        )
+
+        # Data Table settings
+        col.data_type = col_data.get('data_type', 'text')
+        col.required = col_data.get('required', False)
+        col.unique = col_data.get('unique', False)
+        col.category_mode = col_data.get('category_mode', 'single')
+        col.categories = col_data.get('categories', [])
+        col.min_value = col_data.get('min_value', None)
+        col.max_value = col_data.get('max_value', None)
+        col.step = col_data.get('step', None)
+        col.file_path_mode = col_data.get('file_path_mode', 'filename')
+
+        return col
+
+    def _add_row(self, values):
+        """Add a new row with given values."""
+        # Ensure all columns have values
+        row_dict = {}
+        for col in self.current_columns:
+            row_dict[col.name] = values.get(col.name, "")
+        self.rows.append(row_dict)
+        self._update_data_table()
+        self._save_synthesizer_state()
+
+        # Auto-add to Good examples if the first column has a value
+        if self.current_columns:
+            first_col = self.current_columns[0].name
+            val = row_dict.get(first_col)
+            if val and val not in self.good_examples:
+                self.good_examples.append(val)
+                self._update_counts()
+
+    def _update_row(self, row_index, values):
+        """Update an existing row with new values."""
+        if row_index < 0 or row_index >= len(self.rows):
+            return
+
+        # Ask for confirmation before updating
+        reply = QMessageBox.question(
+            self,
+            "Update Row",
+            "Update this row?\n\nThis will update the row and any associated examples.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            old_row = self.rows[row_index]
+            row = self.rows[row_index]
+
+            # Check if any values changed
+            changed = False
+            for col in self.current_columns:
+                new_val = values.get(col.name, "")
+                if row.get(col.name) != new_val:
+                    changed = True
+                    # If this value was in Good examples, update it
+                    old_val = row.get(col.name)
+                    if old_val in self.good_examples:
+                        idx = self.good_examples.index(old_val)
+                        self.good_examples[idx] = new_val
+                    row[col.name] = new_val
+
+            if changed:
+                self._update_data_table()
+                self._save_synthesizer_state()
+                self._update_counts()
+                QMessageBox.information(self, "Updated", "Row updated successfully.")
+
+    def _delete_row(self, row_index):
+        """Delete a row."""
+        if row_index < 0 or row_index >= len(self.rows):
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Delete Row",
+            "Delete this row?\n\nThis will also remove it from Good examples.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            # Remove from Good examples if present
+            row_data = self.rows[row_index]
+            for col in self.current_columns:
+                val = row_data.get(col.name)
+                if val in self.good_examples:
+                    self.good_examples.remove(val)
+
+            del self.rows[row_index]
+            self._update_data_table()
+            self._save_synthesizer_state()
+            self._update_counts()
+            self.row_editor_panel.clear()
+
+    def _on_table_row_selected(self):
+        """Load selected row into row editor."""
+        selected = self.data_table.selectedItems()
+        if not selected:
+            self.row_editor_panel.clear()
+            return
+
+        row = selected[0].row()
+        # Get the row data from the first column's UserRole
+        item = self.data_table.item(row, 0)
+        if item:
+            row_data = item.data(Qt.UserRole)
+            if row_data:
+                self.row_editor_panel.load_row(row, row_data)
+                self._load_active_column_value(row_data)
+                return
+
+        # Fallback: build row data from all columns
+        row_data = {}
+        for j, col in enumerate(self.current_columns):
+            item = self.data_table.item(row, j)
+            if item:
+                row_data[col.name] = item.text()
+        self.row_editor_panel.load_row(row, row_data)
+        self._load_active_column_value(row_data)
+
+    def _update_data_table(self):
+        """Refresh the data table with current columns and rows."""
+        self.data_table.clear()
+        self.data_table.setColumnCount(len(self.current_columns))
+        self.data_table.setHorizontalHeaderLabels([col.name for col in self.current_columns])
+
+        # Apply search filter
+        search_text = self.table_search.text().strip().lower()
+        filter_col = self.table_column_filter.currentData()
+        filtered_rows = self.rows
+        if search_text:
+            filtered_rows = []
+            for row in self.rows:
+                if filter_col is None:
+                    if any(search_text in str(v).lower() for v in row.values()):
+                        filtered_rows.append(row)
+                else:
+                    val = row.get(filter_col, '')
+                    if search_text in str(val).lower():
+                        filtered_rows.append(row)
+
+        self.data_table.setRowCount(len(filtered_rows))
+        for i, row in enumerate(filtered_rows):
+            for j, col in enumerate(self.current_columns):
+                value = row.get(col.name, '')
+                if isinstance(value, list):
+                    value = ', '.join(value)
+                item = QTableWidgetItem(str(value))
+                item.setData(Qt.UserRole, row)  # Store the ENTIRE row dict
+                self.data_table.setItem(i, j, item)
+
+        # Apply highlighting for required/unique constraints
+        self._apply_constraint_highlighting()
+
+        self.data_table.resizeColumnsToContents()
+
+
+    def _apply_constraint_highlighting(self):
+        """Highlight rows based on required and unique constraints."""
+        for i in range(self.data_table.rowCount()):
+            for j, col in enumerate(self.current_columns):
+                item = self.data_table.item(i, j)
+                if not item:
+                    continue
+
+                value = item.text()
+                row = item.data(Qt.UserRole)
+                if not row:
+                    continue
+
+                # Check required - highlight missing required fields in red
+                if getattr(col, 'required', False):
+                    if not value or value.strip() == '':
+                        item.setBackground(QBrush(QColor(255, 200, 200)))  # Light red
+                        item.setToolTip("This field is required")
+                        continue
+
+                # Check unique - highlight duplicates in blue
+                if getattr(col, 'unique', False) and value:
+                    # Count occurrences of this value in the column
+                    count = 0
+                    for r in self.rows:
+                        if str(r.get(col.name, '')) == value:
+                            count += 1
+                    if count > 1:
+                        item.setBackground(QBrush(QColor(200, 220, 255)))  # Light blue
+                        item.setToolTip("Duplicate value")
+
+                # If no constraint applies, reset background
+                if item.background().color() == QColor(255, 255, 255):
+                    # Don't reset if it's already highlighted
+                    pass
+
+
+    def _update_column_filter(self):
+        """Update the column filter dropdown with current columns."""
+        self.table_column_filter.blockSignals(True)
+        self.table_column_filter.clear()
+        self.table_column_filter.addItem("All Columns", None)
+        for col in self.current_columns:
+            self.table_column_filter.addItem(col.name, col.name)
+        self.table_column_filter.blockSignals(False)
+
+
+    def _on_table_search(self):
+        """Handle search text or filter change."""
+        self._update_data_table()
+
+    def _toggle_editor_panel(self):
+        """Show/hide the right editor panel."""
+        visible = self.toggle_editor_btn.isChecked()
+        self.editor_panel.setVisible(visible)
+        self.toggle_editor_btn.setText("📝 Show Editor" if visible else "📝 Hide Editor")
+
