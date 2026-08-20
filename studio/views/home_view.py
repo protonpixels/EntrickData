@@ -74,13 +74,11 @@ class HomeView(QWidget):
         self.filter_layout.setSpacing(10)
 
         self.all_btn = self._create_filter_button("📂 All Projects", True)
-        self.table_btn = self._create_filter_button("📊 Data Tables", False)
         self.research_btn = self._create_filter_button("🌐 Data Research", False)
         self.document_btn = self._create_filter_button("📄 Documents", False)
         self.chat_btn = self._create_filter_button("💬 Chat Projects", False)
 
         self.filter_layout.addWidget(self.all_btn)
-        self.filter_layout.addWidget(self.table_btn)
         self.filter_layout.addWidget(self.research_btn)
         self.filter_layout.addWidget(self.document_btn)
         self.filter_layout.addWidget(self.chat_btn)
@@ -132,7 +130,7 @@ class HomeView(QWidget):
     def _filter_projects(self, filter_text):
         """Filter projects by type"""
         # Reset all buttons
-        for btn in [self.all_btn, self.table_btn, self.research_btn, self.document_btn, self.chat_btn]:
+        for btn in [self.all_btn, self.research_btn, self.document_btn, self.chat_btn]:
             btn.setChecked(False)
             self._update_filter_style(btn, False)
 
@@ -141,10 +139,6 @@ class HomeView(QWidget):
             self.current_filter = None
             self.all_btn.setChecked(True)
             self._update_filter_style(self.all_btn, True)
-        elif filter_text == "📊 Data Tables":
-            self.current_filter = "data_table"
-            self.table_btn.setChecked(True)
-            self._update_filter_style(self.table_btn, True)
         elif filter_text == "🌐 Data Research":
             self.current_filter = "data_research"
             self.research_btn.setChecked(True)

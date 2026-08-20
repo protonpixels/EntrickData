@@ -293,7 +293,6 @@ class MainWindow(QMainWindow):
         self.filter_buttons = {}
         filter_names = [
             ("📂 All", None),
-            ("📊 Tables", "data_table"),
             ("🌐 Research", "data_research"),
             ("📄 Documents", "data_document"),
             ("💬 Chat", "data_chat"),
@@ -467,22 +466,13 @@ class MainWindow(QMainWindow):
             return
 
         # Import views
-        from views.data_table_view import DataTableView
         from views.data_research_view import DataResearchView
         from views.data_document_view import DataDocumentView
         from views.data_chat_view import DataChatView
         from views.data_synthesizer_view import DataSynthesizerView
 
-        # Sync schema for data table projects
-        if project_data['project_type'] == ProjectType.DATA_TABLE.value:
-            self.db.sync_schema_with_metadata(project_id)
-            project_data = self.db.get_project(project_id)
 
-        # Create appropriate view
-        if project_data['project_type'] == ProjectType.DATA_TABLE.value:
-            view = DataTableView(self, self.db, project_data)
-            icon = "📊"
-        elif project_data['project_type'] == ProjectType.DATA_RESEARCH.value:
+        if project_data['project_type'] == ProjectType.DATA_RESEARCH.value:
             view = DataResearchView(self, self.db, project_data)
             icon = "🌐"
         elif project_data['project_type'] == ProjectType.DATA_DOCUMENT.value:
@@ -614,12 +604,6 @@ class MainWindow(QMainWindow):
             self.load_sidebar()
             self.load_projects()
 
-    def refresh_table_view(self, project_id):
-        """Refresh the table view for a specific project."""
-        if project_id in self.tab_widgets:
-            tab_index, widget = self.tab_widgets[project_id]
-            if hasattr(widget, 'refresh_table_data'):
-                widget.refresh_table_data()
 
     def update_status(self, message: str):
         """Update status bar message."""

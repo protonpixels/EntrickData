@@ -79,29 +79,7 @@ class StudioDatabase:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
 
-        if project_type == ProjectType.DATA_TABLE.value:
-            # Data Table project schema
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS data (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    _row_created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    _row_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            # Add initial columns from metadata if provided
-            if metadata and 'column_config' in metadata:
-                for col_config in metadata['column_config']:
-                    col_name = col_config.get('name')
-                    col_type = col_config.get('type', 'text')
-                    if col_name:
-                        sqlite_type = self._get_sqlite_type(col_type)
-                        try:
-                            cursor.execute(f"ALTER TABLE data ADD COLUMN '{col_name}' {sqlite_type}")
-                        except sqlite3.OperationalError:
-                            pass  # Column might already exist
-
-        elif project_type == ProjectType.DATA_RESEARCH.value:
+        if project_type == ProjectType.DATA_RESEARCH.value:
             # Data Research project schema
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS pages (
@@ -995,133 +973,6 @@ class StudioDatabase:
             conn.close()
             return []
 
-    def get_all_data_table_projects(self) -> List[Dict]:
-        """Get all data table projects"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            SELECT id, name, headline, metadata, data_path
-            FROM projects
-            WHERE project_type = ? AND is_active = 1
-            ORDER BY name
-        ''', (ProjectType.DATA_TABLE.value,))
-
-        projects = []
-        for row in cursor.fetchall():
-            projects.append({
-                'id': row[0],
-                'name': row[1],
-                'headline': row[2] or '',
-                'metadata': json.loads(row[3]) if row[3] else {},
-                'data_path': row[4]
-            })
-
-        conn.close()
-        return projects
-
-    def get_table_column_names(self, data_path: str) -> List[str]:
-        """Get column names from a data table project in the correct order"""
-        if not os.path.exists(data_path):
-            return []
-
-        conn = sqlite3.connect(data_path)
-        cursor = conn.cursor()
-
-        try:
-            cursor.execute("PRAGMA table_info(data)")
-            # Get columns in the order they appear in the table
-            columns = [col[1] for col in cursor.fetchall()
-                       if col[1] not in ['id', '_row_created_at', '_row_updated_at']]
-            conn.close()
-            return columns
-        except sqlite3.OperationalError:
-            conn.close()
-            return []
-
-    def sync_schema_with_metadata(self, project_id: int):
-        """Sync the database schema with the metadata column config"""
-        project = self.get_project(project_id)
-        if not project:
-            return
-
-        data_path = project['data_path']
-        if not os.path.exists(data_path):
-            return
-
-        # Get columns from database
-        conn = sqlite3.connect(data_path)
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(data)")
-        db_columns = cursor.fetchall()
-        conn.close()
-
-        db_column_names = []
-        for col in db_columns:
-            col_name = col[1]
-            if col_name not in ['id', '_row_created_at', '_row_updated_at']:
-                db_column_names.append(col_name)
-
-        # Get columns from metadata
-        metadata = project.get('metadata', {})
-        metadata_columns = metadata.get('column_config', [])
-        metadata_column_names = [col['name'] for col in metadata_columns]
-
-        # If they don't match, update metadata to match database
-        if sorted(db_column_names) != sorted(metadata_column_names):
-            # Rebuild metadata from database schema
-            new_config = []
-            for col_name in db_column_names:
-                # Find existing config for this column
-                existing = next((c for c in metadata_columns if c.get('name') == col_name), None)
-                if existing:
-                    new_config.append(existing)
-                else:
-                    # Create default config
-                    new_config.append({
-                        'name': col_name,
-                        'type': 'text',
-                        'type_display': 'Text',
-                        'required': False,
-                        'unique': False,
-                        'desc': ''
-                    })
-
-            metadata['column_config'] = new_config
-            self.update_project(project_id, metadata=metadata)
-
-    def get_table_data(self, data_path: str) -> List[List]:
-        """Get all data from a data table project"""
-        if not os.path.exists(data_path):
-            return []
-
-        conn = sqlite3.connect(data_path)
-        cursor = conn.cursor()
-
-        try:
-            cursor.execute('SELECT * FROM data ORDER BY id')
-            rows = cursor.fetchall()
-
-            # Get column names (excluding internal columns)
-            cursor2 = conn.cursor()  # Use the same connection, not a new one
-            cursor2.execute("PRAGMA table_info(data)")
-            all_columns = cursor2.fetchall()
-            cursor2.close()
-
-            skip_columns = ['id', '_row_created_at', '_row_updated_at']
-            include_indices = [i for i, col in enumerate(all_columns) if col[1] not in skip_columns]
-
-            result = []
-            for row in rows:
-                result.append([row[i] for i in include_indices])
-
-            conn.close()
-            return result
-        except sqlite3.OperationalError as e:
-            conn.close()
-            print(f"Error getting table data: {e}")
-            return []
-
     def get_project_text_pool(self, project_id: int) -> str:
         """Get all text content from a project for ML training."""
         project = self.get_project(project_id)
@@ -1131,14 +982,7 @@ class StudioDatabase:
         project_type = project.get('project_type')
         data_path = project.get('data_path')
 
-        if project_type == 'data_table':
-            rows = self.get_table_data(data_path)
-            text_parts = []
-            for row in rows:
-                text_parts.extend([str(cell) for cell in row if cell])
-            return '\n'.join(text_parts)
-
-        elif project_type in ['data_research', 'data_document']:
+        if project_type in ['data_research', 'data_document']:
             # Use the WebExtractor to clean the text properly
             from studio.core.web_extractor import WebExtractor
             extractor = WebExtractor()
