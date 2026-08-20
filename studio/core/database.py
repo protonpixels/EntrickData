@@ -5,7 +5,7 @@ import json
 import os
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from .project_types import ProjectType
+from studio.core.project_types import ProjectType
 
 
 class StudioDatabase:
@@ -141,21 +141,23 @@ class StudioDatabase:
                 END
     ''')
 
+
         elif project_type == ProjectType.DATA_DOCUMENT.value:
-            # Data Document project schema (similar to research but without URL uniqueness)
+            # Data Document project schema - simplified, no FTS
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS pages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    url TEXT,
-                    title TEXT,
-                    main_text TEXT,
-                    main_html TEXT,
-                    metadata TEXT,
-                    raw_html TEXT,
-                    content_hash TEXT,
-                    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+                    CREATE TABLE IF NOT EXISTS pages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        url TEXT,
+                        title TEXT,
+                        main_text TEXT,
+                        main_html TEXT,
+                        metadata TEXT,
+                        raw_html TEXT,
+                        content_hash TEXT,
+                        fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        rich_text TEXT
+                    )
+                ''')
 
         elif project_type == ProjectType.DATA_CHAT.value:
             # Data Chat project schema
@@ -689,11 +691,8 @@ class StudioDatabase:
             return 0
 
     # ========== DATA RESEARCH METHODS ==========
-
-
     def get_research_pages(self, data_path: str) -> List[Dict]:
-        """Get all pages from a research project with caching."""
-        # Check cache first
+        """Get all pages from a research/document project with caching."""
         if data_path in self._research_pages_cache:
             return self._research_pages_cache[data_path]
 
@@ -704,29 +703,144 @@ class StudioDatabase:
         cursor = conn.cursor()
 
         try:
-            cursor.execute('''
-                SELECT id, url, title, main_text, main_html, metadata, raw_html, fetched_at
-                FROM pages ORDER BY fetched_at DESC
-            ''')
-            rows = cursor.fetchall()
-            conn.close()
+            # Check if pages table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pages'")
+            if not cursor.fetchone():
+                conn.close()
+                return []
 
-            result = [{
-                'id': row[0],
-                'url': row[1],
-                'title': row[2] or '',
-                'main_text': row[3] or '',
-                'main_html': row[4] or '',
-                'metadata': json.loads(row[5]) if row[5] else {},
-                'raw_html': row[6] or '',
-                'fetched_at': row[7]
-            } for row in rows]
+            # Check which columns exist
+            cursor.execute("PRAGMA table_info(pages)")
+            columns = [col[1] for col in cursor.fetchall()]
+            has_rich_text = 'rich_text' in columns
 
-            # Cache the result
+            # Build query based on available columns
+            if has_rich_text:
+                cursor.execute('''
+                    SELECT id, url, title, main_text, main_html, metadata, raw_html, fetched_at, rich_text
+                    FROM pages ORDER BY fetched_at DESC
+                ''')
+                rows = cursor.fetchall()
+                conn.close()
+
+                result = [{
+                    'id': row[0],
+                    'url': row[1] or '',
+                    'title': row[2] or '',
+                    'main_text': row[3] or '',
+                    'main_html': row[4] or '',
+                    'metadata': json.loads(row[5]) if row[5] else {},
+                    'raw_html': row[6] or '',
+                    'fetched_at': row[7],
+                    'rich_text': row[8] or ''
+                } for row in rows]
+            else:
+                cursor.execute('''
+                    SELECT id, url, title, main_text, main_html, metadata, raw_html, fetched_at
+                    FROM pages ORDER BY fetched_at DESC
+                ''')
+                rows = cursor.fetchall()
+                conn.close()
+
+                result = [{
+                    'id': row[0],
+                    'url': row[1] or '',
+                    'title': row[2] or '',
+                    'main_text': row[3] or '',
+                    'main_html': row[4] or '',
+                    'metadata': json.loads(row[5]) if row[5] else {},
+                    'raw_html': row[6] or '',
+                    'fetched_at': row[7],
+                    'rich_text': ''
+                } for row in rows]
+
             self._research_pages_cache[data_path] = result
             return result
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as e:
             conn.close()
+            print(f"Error getting research pages: {e}")
+            return []
+        except Exception as e:
+            conn.close()
+            print(f"Unexpected error in get_research_pages: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    def get_document_pages(self, data_path: str) -> List[Dict]:
+        """Get all pages from a document project with caching."""
+        if data_path in self._research_pages_cache:
+            return self._research_pages_cache[data_path]
+
+        if not os.path.exists(data_path):
+            return []
+
+        conn = sqlite3.connect(data_path)
+        cursor = conn.cursor()
+
+        try:
+            # Check if pages table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pages'")
+            if not cursor.fetchone():
+                conn.close()
+                return []
+
+            # Get all columns
+            cursor.execute("PRAGMA table_info(pages)")
+            columns = [col[1] for col in cursor.fetchall()]
+            has_rich_text = 'rich_text' in columns
+
+            # Build query
+            if has_rich_text:
+                cursor.execute('''
+                    SELECT id, url, title, main_text, main_html, metadata, raw_html, fetched_at, rich_text
+                    FROM pages ORDER BY fetched_at DESC
+                ''')
+                rows = cursor.fetchall()
+                conn.close()
+
+                result = [{
+                    'id': row[0],
+                    'url': row[1] or '',
+                    'title': row[2] or '',
+                    'main_text': row[3] or '',
+                    'main_html': row[4] or '',
+                    'metadata': json.loads(row[5]) if row[5] else {},
+                    'raw_html': row[6] or '',
+                    'fetched_at': row[7],
+                    'rich_text': row[8] or ''
+                } for row in rows]
+            else:
+                cursor.execute('''
+                    SELECT id, url, title, main_text, main_html, metadata, raw_html, fetched_at
+                    FROM pages ORDER BY fetched_at DESC
+                ''')
+                rows = cursor.fetchall()
+                conn.close()
+
+                result = [{
+                    'id': row[0],
+                    'url': row[1] or '',
+                    'title': row[2] or '',
+                    'main_text': row[3] or '',
+                    'main_html': row[4] or '',
+                    'metadata': json.loads(row[5]) if row[5] else {},
+                    'raw_html': row[6] or '',
+                    'fetched_at': row[7],
+                    'rich_text': ''
+                } for row in rows]
+
+            self._research_pages_cache[data_path] = result
+            return result
+        except sqlite3.OperationalError as e:
+            conn.close()
+            print(f"Error getting document pages: {e}")
+            return []
+        except Exception as e:
+            conn.close()
+            print(f"Unexpected error in get_document_pages: {e}")
+            import traceback
+            traceback.print_exc()
             return []
 
     def clear_cache(self):
@@ -1087,3 +1201,60 @@ class StudioDatabase:
             self.add_table_row(data_path, row_data)
 
         return project_id
+
+    def _migrate_document_db(self, data_path: str):
+        """Migrate existing document database to add rich_text column."""
+        if not os.path.exists(data_path):
+            return
+
+        try:
+            conn = sqlite3.connect(data_path)
+            cursor = conn.cursor()
+
+            # Check if pages table exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pages'")
+            if not cursor.fetchone():
+                conn.close()
+                return
+
+            # Check if rich_text column exists
+            cursor.execute("PRAGMA table_info(pages)")
+            columns = [col[1] for col in cursor.fetchall()]
+
+            if 'rich_text' not in columns:
+                print(f"📦 Migrating database: {data_path} - adding rich_text column")
+                cursor.execute("ALTER TABLE pages ADD COLUMN rich_text TEXT")
+                conn.commit()
+                print("✅ Migration complete")
+            conn.close()
+        except Exception as e:
+            print(f"⚠️ Migration error: {e}")
+
+    def _ensure_rich_text_column(self):
+        """Add rich_text column to pages table if it doesn't exist."""
+        if not os.path.exists(self.data_path):
+            return
+
+        try:
+            conn = sqlite3.connect(self.data_path)
+            cursor = conn.cursor()
+
+            # Check if table exists first
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pages'")
+            if not cursor.fetchone():
+                conn.close()
+                return
+
+            # Check if rich_text column exists
+            cursor.execute("PRAGMA table_info(pages)")
+            columns = [col[1] for col in cursor.fetchall()]
+
+            if 'rich_text' not in columns:
+                print(f"📦 Adding rich_text column to: {self.data_path}")
+                cursor.execute("ALTER TABLE pages ADD COLUMN rich_text TEXT")
+                conn.commit()
+                print("✅ Added rich_text column")
+
+            conn.close()
+        except Exception as e:
+            print(f"⚠️ Error in _ensure_rich_text_column: {e}")

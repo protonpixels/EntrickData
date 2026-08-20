@@ -5,18 +5,20 @@ from typing import Dict
 from PySide6.QtWidgets import (
     QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QMessageBox, QStatusBar, QLabel, QInputDialog, QTextEdit,
-    QTreeWidget, QTreeWidgetItem, QPushButton, QMenu, QSplitter
+    QTreeWidget, QTreeWidgetItem, QPushButton, QMenu, QSplitter,
+    QScrollArea, QFrame, QToolButton, QSizePolicy, QLineEdit,
+    QComboBox, QListWidget, QListWidgetItem, QToolBar, QTabBar
 )
-from PySide6.QtCore import Qt, QSize
-from PySide6.QtGui import QAction
+from PySide6.QtCore import Qt, QSize, QTimer, Signal
+from PySide6.QtGui import QAction, QIcon, QFont, QColor
+
 from core.database import StudioDatabase
 from core.project_types import ProjectType
-from .home_view import HomeView
-from .shared_components import CreateProjectDialog
+from .shared_components import CreateProjectDialog, ProjectCard
 
 
 class MainWindow(QMainWindow):
-    """Main window with tabbed project management and container support"""
+    """Main window with clean tab bar at top."""
 
     def __init__(self):
         super().__init__()
@@ -28,345 +30,614 @@ class MainWindow(QMainWindow):
         os.makedirs(cache_dir, exist_ok=True)
         self.db = StudioDatabase(os.path.join(cache_dir, 'studio.db'))
 
+        # State
+        self.current_container_id = None
+        self.current_filter = None
+        self.container_cache = {}
+        self.home_tab_index = 0
+
         # Tab tracking
-        self.project_tabs = {}  # tab_index -> project_id
-        self.tab_widgets = {}  # project_id -> (tab_index, widget)
+        self.project_tabs = {}
+        self.tab_widgets = {}
 
         self.setup_ui()
-        self.load_project_tree()
-        self.show_home_tab()
+        self.load_sidebar()
+        self.load_projects()
+        self.update_status("Ready")
 
     def setup_ui(self):
-        """Setup the main UI with project tree and tabs"""
+        """Setup the main UI with clean tab bar."""
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
 
-        main_layout = QHBoxLayout()
+        main_layout = QVBoxLayout()
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # === LEFT PANEL: Project Tree ===
-        left_panel = QWidget()
-        left_panel.setFixedWidth(300)
-        left_panel.setStyleSheet("""
-            QWidget {
-                background-color: #f8f9fa;
-                border-right: 1px solid #e0e0e0;
-            }
-        """)
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(5, 5, 5, 5)
-        left_layout.setSpacing(5)
-
-        # Tree header with buttons
-        header_layout = QHBoxLayout()
-        header_label = QLabel("📁 Projects")
-        header_label.setStyleSheet("font-weight: bold; font-size: 14px;")
-        header_layout.addWidget(header_label)
-        header_layout.addStretch()
-
-        # New Folder button
-        new_folder_btn = QPushButton("📁")
-        new_folder_btn.setFixedSize(28, 28)
-        new_folder_btn.setToolTip("New Folder")
-        new_folder_btn.setStyleSheet("""
-            QPushButton {
-                background-color: transparent;
-                border: none;
-                font-size: 16px;
-            }
-            QPushButton:hover {
-                background-color: #e0e0e0;
-                border-radius: 4px;
-            }
-        """)
-        new_folder_btn.clicked.connect(self._create_container)
-        header_layout.addWidget(new_folder_btn)
-
-        # New Project button
-        new_project_btn = QPushButton("📄")
-        new_project_btn.setFixedSize(28, 28)
-        new_project_btn.setToolTip("New Project")
-        new_project_btn.setStyleSheet("""
-            QPushButton {
-                background-color: transparent;
-                border: none;
-                font-size: 16px;
-            }
-            QPushButton:hover {
-                background-color: #e0e0e0;
-                border-radius: 4px;
-            }
-        """)
-        new_project_btn.clicked.connect(self._create_project)
-        header_layout.addWidget(new_project_btn)
-
-        left_layout.addLayout(header_layout)
-
-        # Project tree
-        self.project_tree = QTreeWidget()
-        self.project_tree.setHeaderHidden(True)
-        self.project_tree.setIndentation(20)
-        self.project_tree.setStyleSheet("""
-            QTreeWidget {
-                background-color: transparent;
-                border: none;
-                font-size: 13px;
-                outline: none;
-            }
-            QTreeWidget::item {
-                padding: 4px 0px;
-            }
-            QTreeWidget::item:hover {
-                background-color: #e8f0fe;
-                border-radius: 4px;
-            }
-            QTreeWidget::item:selected {
-                background-color: #d0e4ff;
-                border-radius: 4px;
-            }
-        """)
-        self.project_tree.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
-        self.project_tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.project_tree.customContextMenuRequested.connect(self._show_tree_context_menu)
-
-        left_layout.addWidget(self.project_tree)
-
-        # === RIGHT PANEL: Tab Widget ===
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(0)
-
+        # === TAB WIDGET ===
         self.tab_widget = QTabWidget()
         self.tab_widget.setTabsClosable(True)
-        self.tab_widget.tabCloseRequested.connect(self.close_project_tab)
+        self.tab_widget.tabCloseRequested.connect(self.close_tab)
+        self.tab_widget.currentChanged.connect(self.on_tab_changed)
         self.tab_widget.setStyleSheet("""
             QTabWidget::pane {
                 border: 1px solid #d0d0d0;
                 background: white;
+                border-top: none;
+            }
+            QTabBar {
+                background-color: #f5f7fa;
+                border-bottom: 1px solid #e0e0e0;
             }
             QTabBar::tab {
-                padding: 8px 16px;
+                padding: 8px 20px;
                 margin-right: 2px;
-                background: #f0f0f0;
+                background: #e8e8e8;
                 font-size: 13px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
             }
             QTabBar::tab:selected {
                 background: white;
                 border-bottom: 2px solid #4CAF50;
             }
             QTabBar::tab:hover {
-                background: #e0e0e0;
+                background: #d0d0d0;
+            }
+            QTabBar::tab:!selected {
+                color: #666;
             }
             QTabBar::close-button {
-                padding: 2px;
+                padding: 2px 4px;
+                border-radius: 2px;
+            }
+            QTabBar::close-button:hover {
+                background-color: #ff6b6b;
+                color: white;
             }
         """)
+        main_layout.addWidget(self.tab_widget)
 
-        right_layout.addWidget(self.tab_widget)
-
-        # Add panels to main layout
-        main_layout.addWidget(left_panel)
-        main_layout.addWidget(right_panel)
-        self.central_widget.setLayout(main_layout)
-
-        # Status bar
+        # === STATUS BAR ===
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_label = QLabel()
         self.status_bar.addWidget(self.status_label)
-        self.update_status("Ready")
+        self.status_bar.setStyleSheet("""
+            QStatusBar {
+                background-color: #f5f7fa;
+                border-top: 1px solid #e0e0e0;
+            }
+        """)
 
-    def load_project_tree(self):
-        """Load projects into the tree with containers"""
-        self.project_tree.clear()
+        self.central_widget.setLayout(main_layout)
 
-        # Get container tree
+        # Create home tab
+        self.create_home_tab()
+
+    def create_home_tab(self):
+        """Create the home tab with sidebar and project list."""
+        home_widget = QWidget()
+        home_layout = QHBoxLayout()
+        home_layout.setContentsMargins(0, 0, 0, 0)
+        home_layout.setSpacing(0)
+
+        # === SIDEBAR ===
+        sidebar = self._create_sidebar()
+        home_layout.addWidget(sidebar)
+
+        # === CONTENT ===
+        content_panel = self._create_content_panel()
+        home_layout.addWidget(content_panel)
+
+        home_widget.setLayout(home_layout)
+
+        # Add tab at position 0 (far left)
+        tab_index = self.tab_widget.insertTab(0, home_widget, "🏠 Home")
+        self.tab_widget.setTabToolTip(tab_index, "Home")
+        self.home_tab_index = tab_index
+
+        # Make home tab not closable
+        self.tab_widget.tabBar().tabButton(tab_index, QTabBar.RightSide)
+        self.tab_widget.tabBar().tabButton(tab_index, QTabBar.LeftSide)
+
+        self.tab_widget.setCurrentIndex(tab_index)
+
+    def _create_sidebar(self):
+        """Create the sidebar for the home tab."""
+        sidebar = QWidget()
+        sidebar.setFixedWidth(220)
+        sidebar.setStyleSheet("""
+            QWidget {
+                background-color: #f5f7fa;
+                border-right: 1px solid #e0e0e0;
+            }
+            QListWidget {
+                background-color: transparent;
+                border: none;
+                outline: none;
+                font-size: 13px;
+            }
+            QListWidget::item {
+                padding: 8px 12px;
+                border-radius: 4px;
+                margin: 1px 4px;
+            }
+            QListWidget::item:hover {
+                background-color: #e8f0fe;
+            }
+            QListWidget::item:selected {
+                background-color: #d0e4ff;
+                color: #1a237e;
+            }
+            QPushButton {
+                background-color: transparent;
+                border: none;
+                padding: 6px 12px;
+                text-align: left;
+                font-size: 13px;
+                font-weight: bold;
+                color: #1c242e;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #e8f0fe;
+            }
+            QLineEdit {
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 12px;
+                background-color: white;
+            }
+            QLineEdit:focus {
+                border-color: #4CAF50;
+            }
+        """)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
+
+        # Logo
+        logo = QLabel("📊 Projects")
+        logo.setStyleSheet("""
+            font-size: 16px;
+            font-weight: bold;
+            color: #1c242e;
+            padding: 8px 8px 4px 8px;
+        """)
+        layout.addWidget(logo)
+
+        # Search in sidebar
+        self.sidebar_search = QLineEdit()
+        self.sidebar_search.setPlaceholderText("🔍 Filter...")
+        self.sidebar_search.textChanged.connect(self.filter_sidebar)
+        layout.addWidget(self.sidebar_search)
+
+        # Quick actions
+        action_layout = QHBoxLayout()
+        action_layout.setSpacing(4)
+
+        new_project_btn = QPushButton("📄 New")
+        new_project_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        new_project_btn.clicked.connect(self._create_project)
+        action_layout.addWidget(new_project_btn)
+
+        new_folder_btn = QPushButton("📁 Folder")
+        new_folder_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+                font-weight: bold;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #F57C00;
+            }
+        """)
+        new_folder_btn.clicked.connect(self._create_container)
+        action_layout.addWidget(new_folder_btn)
+
+        action_layout.addStretch()
+        layout.addLayout(action_layout)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("background-color: #e0e0e0; margin: 4px 0;")
+        layout.addWidget(sep)
+
+        # Sidebar list
+        self.sidebar_list = QListWidget()
+        self.sidebar_list.setSelectionMode(QListWidget.SingleSelection)
+        self.sidebar_list.itemClicked.connect(self.on_sidebar_item_clicked)
+        layout.addWidget(self.sidebar_list)
+
+        layout.addStretch()
+
+        # Bottom action
+        show_all_btn = QPushButton("📂 Show All")
+        show_all_btn.setStyleSheet("font-size: 11px; color: #666; padding: 4px 8px;")
+        show_all_btn.clicked.connect(self.show_all_projects)
+        layout.addWidget(show_all_btn)
+
+        sidebar.setLayout(layout)
+        return sidebar
+
+    def _create_content_panel(self):
+        """Create the content panel for the home tab."""
+        panel = QWidget()
+        panel_layout = QVBoxLayout()
+        panel_layout.setContentsMargins(8, 8, 8, 8)
+        panel_layout.setSpacing(8)
+
+        # Filter buttons
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(8)
+
+        self.filter_buttons = {}
+        filter_names = [
+            ("📂 All", None),
+            ("📊 Tables", "data_table"),
+            ("🌐 Research", "data_research"),
+            ("📄 Documents", "data_document"),
+            ("💬 Chat", "data_chat"),
+            ("🧬 Synthesizers", "data_synthesizer")
+        ]
+
+        for label, filter_type in filter_names:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setStyleSheet("""
+                QPushButton {
+                    padding: 4px 14px;
+                    border-radius: 14px;
+                    font-size: 12px;
+                    font-weight: 600;
+                    background-color: #e0e0e0;
+                    color: #666;
+                    border: none;
+                }
+                QPushButton:checked {
+                    background-color: #4CAF50;
+                    color: white;
+                }
+                QPushButton:hover {
+                    background-color: #d0d0d0;
+                }
+                QPushButton:checked:hover {
+                    background-color: #45a049;
+                }
+            """)
+            btn.clicked.connect(lambda checked, ft=filter_type: self.set_filter(ft))
+            if filter_type is None:
+                btn.setChecked(True)
+            self.filter_buttons[filter_type] = btn
+            top_bar.addWidget(btn)
+
+        top_bar.addStretch()
+        panel_layout.addLayout(top_bar)
+
+        # Scroll area for projects
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
+        self.content_widget = QWidget()
+        self.content_layout = QVBoxLayout(self.content_widget)
+        self.content_layout.setAlignment(Qt.AlignTop)
+        self.content_layout.setSpacing(12)
+        self.content_widget.setLayout(self.content_layout)
+
+        scroll.setWidget(self.content_widget)
+        panel_layout.addWidget(scroll)
+
+        panel.setLayout(panel_layout)
+        return panel
+
+    # ========== SIDEBAR METHODS ==========
+
+    def load_sidebar(self):
+        """Load the sidebar with containers and projects."""
+        self.sidebar_list.clear()
+        self.container_cache = {}
+
+        # Root item
+        root_item = QListWidgetItem("📁 Root")
+        root_item.setData(Qt.UserRole, None)
+        root_item.setToolTip("All projects")
+        self.sidebar_list.addItem(root_item)
+
+        # Get containers
         containers = self.db.get_container_tree()
 
-        # Add containers and their projects
+        # Add containers recursively
+        self._add_containers_to_sidebar(containers, "")
+
+        # Select root by default
+        self.sidebar_list.setCurrentRow(0)
+        self.current_container_id = None
+
+    def _add_containers_to_sidebar(self, containers, prefix):
+        """Recursively add containers to sidebar."""
         for container in containers:
-            self._add_container_to_tree(container, None)
+            item_text = f"{prefix}📁 {container['name']}"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, container['id'])
+            item.setToolTip(f"Container: {container['name']}")
+            self.sidebar_list.addItem(item)
 
-        # Add uncategorized projects
-        uncategorized = self.db.get_uncategorized_projects()
-        if uncategorized:
-            uncat_item = QTreeWidgetItem(self.project_tree)
-            uncat_item.setText(0, "📁 Uncategorized")
-            uncat_item.setData(0, Qt.UserRole, {'type': 'uncategorized'})
-            uncat_item.setExpanded(True)
-            for project in uncategorized:
-                self._add_project_to_tree(project, uncat_item)
+            # Store in cache
+            self.container_cache[container['id']] = container
 
-    def _add_container_to_tree(self, container: Dict, parent_item: QTreeWidgetItem):
-        """Recursively add container and its contents"""
-        item = QTreeWidgetItem(parent_item if parent_item else self.project_tree)
-        item.setText(0, f"📁 {container['name']}")
-        item.setData(0, Qt.UserRole, {'type': 'container', 'id': container['id']})
-        item.setExpanded(True)
+            # Add children
+            if container.get('children'):
+                self._add_containers_to_sidebar(container['children'], "  ")
 
-        # Add projects
-        for project in container['projects']:
-            self._add_project_to_tree(project, item)
+    def filter_sidebar(self, text):
+        """Filter sidebar items."""
+        text = text.lower().strip()
+        for i in range(self.sidebar_list.count()):
+            item = self.sidebar_list.item(i)
+            item.setHidden(text not in item.text().lower())
 
-        # Add child containers
-        for child in container['children']:
-            self._add_container_to_tree(child, item)
+    def on_sidebar_item_clicked(self, item):
+        """Handle sidebar item click."""
+        container_id = item.data(Qt.UserRole)
+        self.current_container_id = container_id
+        self.load_projects()
 
-    def _add_project_to_tree(self, project: Dict, parent_item: QTreeWidgetItem):
-        """Add a project to the tree"""
-        icon = self._get_project_icon(project['project_type'])
-        item = QTreeWidgetItem(parent_item)
-        item.setText(0, f"{icon} {project['name']}")
-        item.setData(0, Qt.UserRole, {'type': 'project', 'id': project['id']})
+    def set_filter(self, filter_type):
+        """Set the project filter."""
+        self.current_filter = filter_type
 
-    def _get_project_icon(self, project_type: str) -> str:
-        icons = {
-            'data_table': '📊',
-            'data_research': '🌐',
-            'data_document': '📄',
-            'data_chat': '💬'
-        }
-        return icons.get(project_type, '📁')
+        # Update button states
+        for ft, btn in self.filter_buttons.items():
+            btn.setChecked(ft == filter_type)
 
-    def _on_tree_item_double_clicked(self, item: QTreeWidgetItem, column: int):
-        """Handle double-click on tree items"""
-        data = item.data(0, Qt.UserRole)
-        if data and data.get('type') == 'project':
-            self.open_project(data['id'])
+        self.load_projects()
 
-    def _show_tree_context_menu(self, position):
-        """Show context menu for tree items"""
-        item = self.project_tree.itemAt(position)
-        menu = QMenu()
+    def show_all_projects(self):
+        """Show all projects (reset container filter)."""
+        self.sidebar_list.setCurrentRow(0)
+        self.current_container_id = None
+        self.load_projects()
 
-        if item is None:
-            # Empty space
-            new_container = QAction("📁 New Folder", self)
-            new_container.triggered.connect(self._create_container)
-            menu.addAction(new_container)
+    def load_projects(self):
+        """Load projects into the content area."""
+        # Clear layout
+        while self.content_layout.count():
+            item = self.content_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
 
-            new_project = QAction("📄 New Project", self)
-            new_project.triggered.connect(self._create_project)
-            menu.addAction(new_project)
+        # Get projects
+        all_projects = self.db.get_all_projects()
+
+        # Apply filter
+        if self.current_filter:
+            all_projects = [p for p in all_projects if p['project_type'] == self.current_filter]
+
+        # Filter by container
+        if self.current_container_id is not None:
+            all_projects = [p for p in all_projects if p.get('container_id') == self.current_container_id]
+
+        if not all_projects:
+            empty_label = QLabel("No projects found.\nClick 'New' to create one!")
+            empty_label.setAlignment(Qt.AlignCenter)
+            empty_label.setStyleSheet("color: #999; font-size: 16px; padding: 60px;")
+            self.content_layout.addWidget(empty_label)
+            return
+
+        # Display projects as cards
+        for project in all_projects:
+            card = ProjectCard(project, self)
+            self.content_layout.addWidget(card)
+
+        self.content_layout.addStretch()
+
+    # ========== TAB MANAGEMENT ==========
+    def open_project(self, project_id: int):
+        """Open a project in a new tab."""
+        project_data = self.db.get_project(project_id)
+        if not project_data:
+            QMessageBox.warning(self, "Error", "Project not found!")
+            return
+
+        # Check if project is already open
+        if project_id in self.tab_widgets:
+            tab_index = self.tab_widgets[project_id][0]
+            self.tab_widget.setCurrentIndex(tab_index)
+            return
+
+        # Import views
+        from views.data_table_view import DataTableView
+        from views.data_research_view import DataResearchView
+        from views.data_document_view import DataDocumentView
+        from views.data_chat_view import DataChatView
+        from views.data_synthesizer_view import DataSynthesizerView
+
+        # Sync schema for data table projects
+        if project_data['project_type'] == ProjectType.DATA_TABLE.value:
+            self.db.sync_schema_with_metadata(project_id)
+            project_data = self.db.get_project(project_id)
+
+        # Create appropriate view
+        if project_data['project_type'] == ProjectType.DATA_TABLE.value:
+            view = DataTableView(self, self.db, project_data)
+            icon = "📊"
+        elif project_data['project_type'] == ProjectType.DATA_RESEARCH.value:
+            view = DataResearchView(self, self.db, project_data)
+            icon = "🌐"
+        elif project_data['project_type'] == ProjectType.DATA_DOCUMENT.value:
+            view = DataDocumentView(self, self.db, project_data)
+            icon = "📄"
+        elif project_data['project_type'] == ProjectType.DATA_CHAT.value:
+            view = DataChatView(self, self.db, project_data)
+            icon = "💬"
+        elif project_data['project_type'] == ProjectType.DATA_SYNTHESIZER.value:
+            view = DataSynthesizerView(self, self.db, project_data)
+            icon = "🧬"
         else:
-            data = item.data(0, Qt.UserRole)
-            if data:
-                if data.get('type') == 'container':
-                    self._add_container_menu(menu, item, data)
-                elif data.get('type') == 'project':
-                    self._add_project_menu(menu, item, data)
-                elif data.get('type') == 'uncategorized':
-                    new_project = QAction("📄 New Project", self)
-                    new_project.triggered.connect(self._create_project)
-                    menu.addAction(new_project)
+            QMessageBox.warning(self, "Error", f"Unknown project type: {project_data['project_type']}")
+            return
 
-        menu.exec_(self.project_tree.mapToGlobal(position))
+        # Insert tab after Home tab (at position 1)
+        tab_name = f"{icon} {project_data['name']}"
+        tab_index = self.tab_widget.insertTab(1, view, tab_name)
+        self.tab_widget.setTabToolTip(tab_index, project_data['name'])
+        self.tab_widget.setCurrentIndex(tab_index)
 
-    def _add_container_menu(self, menu: QMenu, item: QTreeWidgetItem, data: Dict):
-        """Add container-specific menu items"""
-        new_project = QAction("📄 New Project", self)
-        new_project.triggered.connect(lambda: self._create_project_in_container(data['id']))
-        menu.addAction(new_project)
+        # Track tab
+        self.project_tabs[tab_index] = project_id
+        self.tab_widgets[project_id] = (tab_index, view)
 
-        new_container = QAction("📁 New Sub-Folder", self)
-        new_container.triggered.connect(lambda: self._create_sub_container(data['id']))
-        menu.addAction(new_container)
+        self.update_status(f"Opened: {project_data['name']}")
 
-        menu.addSeparator()
 
-        rename = QAction("✏️ Rename", self)
-        rename.triggered.connect(lambda: self._rename_container(item, data['id']))
-        menu.addAction(rename)
 
-        delete = QAction("🗑️ Delete", self)
-        delete.triggered.connect(lambda: self._delete_container(item, data['id']))
-        menu.addAction(delete)
+    def close_tab(self, index: int):
+        """Close a tab."""
+        # Don't close home tab
+        if index == self.home_tab_index:
+            return
 
-    def _add_project_menu(self, menu: QMenu, item: QTreeWidgetItem, data: Dict):
-        """Add project-specific menu items"""
-        open_action = QAction("📖 Open", self)
-        open_action.triggered.connect(lambda: self.open_project(data['id']))
-        menu.addAction(open_action)
+        # Clean up tracking
+        if index in self.project_tabs:
+            project_id = self.project_tabs.pop(index)
+            if project_id in self.tab_widgets:
+                del self.tab_widgets[project_id]
 
-        move_to = QAction("📂 Move to Folder", self)
-        move_to.triggered.connect(lambda: self._move_project(data['id']))
-        menu.addAction(move_to)
+        self.tab_widget.removeTab(index)
 
-        menu.addSeparator()
+        # Home tab index is always 0
+        self.home_tab_index = 0
 
-        rename = QAction("✏️ Rename", self)
-        rename.triggered.connect(lambda: self._rename_project_item(data['id']))
-        menu.addAction(rename)
+    def on_tab_changed(self, index):
+        """Handle tab change (just update status)."""
+        if index == self.home_tab_index:
+            self.update_status("Home")
+        elif index in self.project_tabs:
+            project_id = self.project_tabs[index]
+            project_data = self.db.get_project(project_id)
+            if project_data:
+                self.update_status(f"Viewing: {project_data['name']}")
 
-        delete = QAction("🗑️ Delete", self)
-        delete.triggered.connect(lambda: self._delete_project_item(data['id']))
-        menu.addAction(delete)
-
-    # ========== CONTAINER OPERATIONS ==========
+    # ========== PROJECT OPERATIONS ==========
 
     def _create_container(self):
-        """Create a new root container"""
+        """Create a new container."""
         name, ok = QInputDialog.getText(self, "New Folder", "Enter folder name:")
         if ok and name.strip():
             self.db.create_container(name.strip())
-            self.load_project_tree()
+            self.load_sidebar()
+            self.load_projects()
             self.update_status(f"Created folder: {name}")
 
-    def _create_sub_container(self, parent_id: int):
-        """Create a sub-container"""
-        name, ok = QInputDialog.getText(self, "New Sub-Folder", "Enter sub-folder name:")
-        if ok and name.strip():
-            self.db.create_container(name.strip(), parent_id)
-            self.load_project_tree()
-            self.update_status(f"Created sub-folder: {name}")
+    def _create_project(self, container_id: int = None):
+        """Create a new project."""
+        dialog = CreateProjectDialog(self, self.db, container_id)
+        if dialog.exec_():
+            project_id = dialog.get_project_id()
+            if project_id:
+                self.load_sidebar()
+                self.load_projects()
+                self.open_project(project_id)
+                self.update_status("Project created successfully")
 
-    def _create_project_in_container(self, container_id: int):
-        """Create a new project in a container"""
-        # Reuse the existing project creation logic
-        self._create_project(container_id)
-
-    def _rename_container(self, item: QTreeWidgetItem, container_id: int):
-        """Rename a container"""
-        container = self.db.get_container(container_id)
-        if not container:
-            return
-
-        new_name, ok = QInputDialog.getText(
-            self, "Rename Folder", "Enter new name:",
-            text=container['name']
-        )
-        if ok and new_name.strip():
-            self.db.rename_container(container_id, new_name.strip())
-            self.load_project_tree()
-            self.update_status(f"Renamed folder to: {new_name}")
-
-    def _delete_container(self, item: QTreeWidgetItem, container_id: int):
-        """Delete a container"""
-        container = self.db.get_container(container_id)
-        if not container:
-            return
-
-        reply = QMessageBox.question(
-            self,
-            "Delete Folder",
-            f"Delete folder '{container['name']}'?\n\nProjects will be moved to the parent folder.",
-            QMessageBox.Yes | QMessageBox.No
-        )
-
-        if reply == QMessageBox.Yes:
-            self.db.delete_container(container_id, move_to_parent=True)
-            self.load_project_tree()
-            self.update_status(f"Deleted folder: {container['name']}")
-
-    def _move_project(self, project_id: int):
-        """Move a project to a different container"""
+    def rename_project(self, project_id: int):
+        """Rename a project."""
         project = self.db.get_project(project_id)
         if not project:
             return
 
-        # Get all containers for selection
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Rename Project",
+            "Enter new project name:",
+            text=project['name']
+        )
+
+        if ok and new_name:
+            self.db.update_project(project_id, name=new_name)
+            self.update_status(f"Renamed to: {new_name}")
+
+            # Update tab name if project is open
+            if project_id in self.tab_widgets:
+                tab_index = self.tab_widgets[project_id][0]
+                icon = ProjectType.get_icon(project['project_type'])
+                self.tab_widget.setTabText(tab_index, f"{icon} {new_name}")
+
+            # Refresh
+            self.load_sidebar()
+            self.load_projects()
+
+    def delete_project(self, project_id: int):
+        """Delete a project."""
+        project = self.db.get_project(project_id)
+        if not project:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Delete Project",
+            f"Delete project '{project['name']}' and all its data?\n\nThis action cannot be undone!",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            # Close tab if open
+            if project_id in self.tab_widgets:
+                tab_index = self.tab_widgets[project_id][0]
+                self.close_tab(tab_index)
+
+            self.db.delete_project(project_id)
+            self.update_status(f"Deleted: {project['name']}")
+
+            # Refresh
+            self.load_sidebar()
+            self.load_projects()
+
+    def refresh_table_view(self, project_id):
+        """Refresh the table view for a specific project."""
+        if project_id in self.tab_widgets:
+            tab_index, widget = self.tab_widgets[project_id]
+            if hasattr(widget, 'refresh_table_data'):
+                widget.refresh_table_data()
+
+    def update_status(self, message: str):
+        """Update status bar message."""
+        self.status_label.setText(f"  {message}")
+
+    def show_home_tab(self):
+        """Show the home tab."""
+        self.tab_widget.setCurrentIndex(self.home_tab_index)
+        self.load_projects()
+        self.update_status("Ready")
+
+    def _move_project(self, project_id: int):
+        """Move a project to a different container."""
+        project = self.db.get_project(project_id)
+        if not project:
+            return
+
+        # Get all containers
         containers = self.db.get_container_tree()
         container_names = ["Uncategorized"]
         container_ids = [None]
@@ -399,173 +670,6 @@ class MainWindow(QMainWindow):
             idx = container_names.index(selected)
             container_id = container_ids[idx]
             self.db.move_to_container(project_id, container_id)
-            self.load_project_tree()
+            self.load_sidebar()
+            self.load_projects()
             self.update_status(f"Moved project to: {selected}")
-
-    def _rename_project_item(self, project_id: int):
-        """Rename a project from the tree"""
-        self.rename_project(project_id)
-
-    def _delete_project_item(self, project_id: int):
-        """Delete a project from the tree"""
-        self.delete_project(project_id)
-
-    def _create_project(self, container_id: int = None):
-        """Create a new project"""
-        dialog = CreateProjectDialog(self, self.db, container_id)
-        if dialog.exec_():
-            project_id = dialog.get_project_id()
-            if project_id:
-                self.load_project_tree()
-                self.open_project(project_id)
-                self.update_status("Project created successfully")
-
-    # ========== PROJECT OPERATIONS ==========
-
-    # Update the open_project method
-    def open_project(self, project_id: int):
-        """Open a project in a new tab"""
-        project_data = self.db.get_project(project_id)
-        if not project_data:
-            QMessageBox.warning(self, "Error", "Project not found!")
-            return
-
-        # Check if project is already open
-        if project_id in self.tab_widgets:
-            tab_index = self.tab_widgets[project_id][0]
-            self.tab_widget.setCurrentIndex(tab_index)
-            return
-
-        # Import views
-        from views.data_table_view import DataTableView
-        from views.data_research_view import DataResearchView
-        from views.data_document_view import DataDocumentView
-        from views.data_chat_view import DataChatView
-        from views.data_synthesizer_view import DataSynthesizerView  # NEW
-
-        # Sync schema for data table projects
-        if project_data['project_type'] == ProjectType.DATA_TABLE.value:
-            self.db.sync_schema_with_metadata(project_id)
-            project_data = self.db.get_project(project_id)
-
-        # Create appropriate view based on project type
-        if project_data['project_type'] == ProjectType.DATA_TABLE.value:
-            view = DataTableView(self, self.db, project_data)
-        elif project_data['project_type'] == ProjectType.DATA_RESEARCH.value:
-            view = DataResearchView(self, self.db, project_data)
-        elif project_data['project_type'] == ProjectType.DATA_DOCUMENT.value:
-            view = DataDocumentView(self, self.db, project_data)
-        elif project_data['project_type'] == ProjectType.DATA_CHAT.value:
-            view = DataChatView(self, self.db, project_data)
-        elif project_data['project_type'] == ProjectType.DATA_SYNTHESIZER.value:  # NEW
-            view = DataSynthesizerView(self, self.db, project_data)
-        else:
-            QMessageBox.warning(self, "Error", f"Unknown project type: {project_data['project_type']}")
-            return
-
-        # Add tab
-        tab_name = project_data['name']
-        tab_index = self.tab_widget.addTab(view, tab_name)
-        self.tab_widget.setCurrentIndex(tab_index)
-
-        # Track tab
-        self.project_tabs[tab_index] = project_id
-        self.tab_widgets[project_id] = (tab_index, view)
-
-        self.update_status(f"Opened: {project_data['name']}")
-
-    def close_project_tab(self, index: int):
-        """Close a project tab"""
-        if index < 0:
-            return
-
-        # Don't close if it's the home tab
-        if self.tab_widget.tabText(index) == "🏠 Home":
-            return
-
-        # Clean up tracking
-        if index in self.project_tabs:
-            project_id = self.project_tabs.pop(index)
-            if project_id in self.tab_widgets:
-                del self.tab_widgets[project_id]
-
-        self.tab_widget.removeTab(index)
-
-        # If no tabs left, show home
-        if self.tab_widget.count() == 0:
-            self.show_home_tab()
-
-    def show_home_tab(self):
-        """Show the home tab with project overview"""
-        # Check if home tab already exists
-        for i in range(self.tab_widget.count()):
-            if self.tab_widget.tabText(i) == "🏠 Home":
-                self.tab_widget.setCurrentIndex(i)
-                return
-
-        # Create new home tab
-        home_view = HomeView(self, self.db)
-        tab_index = self.tab_widget.addTab(home_view, "🏠 Home")
-        self.tab_widget.setCurrentIndex(tab_index)
-        self.update_status("Ready")
-
-    def rename_project(self, project_id: int):
-        """Rename a project"""
-        project = self.db.get_project(project_id)
-        if not project:
-            return
-
-        new_name, ok = QInputDialog.getText(
-            self,
-            "Rename Project",
-            "Enter new project name:",
-            text=project['name']
-        )
-
-        if ok and new_name:
-            self.db.update_project(project_id, name=new_name)
-            self.update_status(f"Renamed to: {new_name}")
-
-            # Update tab name if project is open
-            if project_id in self.tab_widgets:
-                tab_index = self.tab_widgets[project_id][0]
-                self.tab_widget.setTabText(tab_index, new_name)
-
-            # Refresh tree
-            self.load_project_tree()
-
-    def delete_project(self, project_id: int):
-        """Delete a project"""
-        project = self.db.get_project(project_id)
-        if not project:
-            return
-
-        reply = QMessageBox.question(
-            self,
-            "Delete Project",
-            f"Delete project '{project['name']}' and all its data?\n\nThis action cannot be undone!",
-            QMessageBox.Yes | QMessageBox.No
-        )
-
-        if reply == QMessageBox.Yes:
-            # Close tab if open
-            if project_id in self.tab_widgets:
-                tab_index = self.tab_widgets[project_id][0]
-                self.close_project_tab(tab_index)
-
-            self.db.delete_project(project_id)
-            self.update_status(f"Deleted: {project['name']}")
-
-            # Refresh tree
-            self.load_project_tree()
-
-    def refresh_table_view(self, project_id):
-        """Refresh the table view for a specific project"""
-        if project_id in self.tab_widgets:
-            tab_index, widget = self.tab_widgets[project_id]
-            if hasattr(widget, 'refresh_table_data'):
-                widget.refresh_table_data()
-
-    def update_status(self, message: str):
-        """Update status bar message"""
-        self.status_label.setText(f"  {message}")

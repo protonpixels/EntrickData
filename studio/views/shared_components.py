@@ -100,6 +100,7 @@ class ProjectCard(QFrame):
             lambda: self.parent_app.open_project(self.project_data['id']) if self.parent_app else None)
         btn_layout.addWidget(open_btn)
 
+
         rename_btn = QPushButton("Rename")
         rename_btn.setStyleSheet("""
             QPushButton {
